@@ -40,6 +40,7 @@ from crosscap_experiment import (
     SteeringExperiment,
     compute_discriminative_thresholds,
     compute_pca_compliance_axis,
+    compute_mean_diff_compliance_axis,
     generate_baseline,
     generate_capped,
     generate_cross_capped,
@@ -78,6 +79,15 @@ PRESETS = {
         "N_COMPLIANCE": 50,
         "MAX_NEW_TOKENS": 256,
         "OUTPUT_DIR": "results/crosscap_full",
+    },
+    "full_meandiff": {
+        "N_PROMPTS": 100,
+        "N_CALIBRATION": 50,
+        "N_COMPLIANCE": 50,
+        "MAX_NEW_TOKENS": 256,
+        "OUTPUT_DIR": "results/crosscap_full_meandiff",
+        "AXIS_METHOD": "mean_diff",
+        "CROSS_ONLY": True,
     },
 }
 
@@ -260,10 +270,12 @@ def run_experiment(
     assistant_taus: dict[int, float],
     compliance_taus: dict[int, float],
     max_new_tokens: int,
+    cross_only: bool = False,
 ) -> pd.DataFrame:
     """Run baseline + assistant-cap + cross-cap for each prompt.
 
     Each prompt dict must have keys: idx, text, type ("jailbreak"/"benign").
+    If cross_only=True, skip assistant-axis capping (only baseline + cross-cap).
 
     Returns DataFrame with one row per prompt.
     """
@@ -297,21 +309,22 @@ def run_experiment(
             logger.exception("  FAILED baseline for prompt %d", prompt["idx"])
             continue
 
-        # 2. Assistant-axis capped
+        # 2. Assistant-axis capped (skip if cross_only)
         cap_ids = None
-        try:
-            cap_ids, _, _, n_cap, cap_active = generate_capped(
-                exp, input_ids, cap_layers, assistant_axis, assistant_taus,
-                track_layers, max_new_tokens, TEMPERATURE, DO_SAMPLE,
-            )
-            cap_text = exp.tokenizer.decode(
-                cap_ids[0, prompt_len:], skip_special_tokens=True
-            )
-        except Exception:
-            logger.exception("  FAILED assistant-cap for prompt %d", prompt["idx"])
-            n_cap = 0
-            cap_active = []
-            cap_text = "NA"
+        n_cap = 0
+        cap_active = []
+        cap_text = "NA"
+        if not cross_only:
+            try:
+                cap_ids, _, _, n_cap, cap_active = generate_capped(
+                    exp, input_ids, cap_layers, assistant_axis, assistant_taus,
+                    track_layers, max_new_tokens, TEMPERATURE, DO_SAMPLE,
+                )
+                cap_text = exp.tokenizer.decode(
+                    cap_ids[0, prompt_len:], skip_special_tokens=True
+                )
+            except Exception:
+                logger.exception("  FAILED assistant-cap for prompt %d", prompt["idx"])
 
         # 3. Cross-axis capped
         cross_ids = None
@@ -374,8 +387,8 @@ def build_prompts(cfg):
     return prompts
 
 
-def save_results(df, output_dir, args, cos_val, cfg, elapsed):
-    """Save 4 CSVs + metadata from a results DataFrame."""
+def save_results(df, output_dir, args, cos_val, cfg, elapsed, cross_only=False):
+    """Save CSVs + metadata from a results DataFrame."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
     jb = df[df["prompt_type"] == "jailbreak"]
@@ -389,12 +402,13 @@ def save_results(df, output_dir, args, cos_val, cfg, elapsed):
         out.to_csv(path, index=False)
         return out
 
-    jb_assist = save_cap_csv(jb, "assistant_cap_applied", "assistant_cap_layers",
-                             "assistant_cap_text", output_dir / "assistant_cap_jailbreak.csv")
+    if not cross_only:
+        jb_assist = save_cap_csv(jb, "assistant_cap_applied", "assistant_cap_layers",
+                                 "assistant_cap_text", output_dir / "assistant_cap_jailbreak.csv")
+        bn_assist = save_cap_csv(bn, "assistant_cap_applied", "assistant_cap_layers",
+                                 "assistant_cap_text", output_dir / "assistant_cap_benign.csv")
     jb_cross  = save_cap_csv(jb, "cross_cap_applied", "cross_cap_layers",
                              "cross_cap_text", output_dir / "cross_cap_jailbreak.csv")
-    bn_assist = save_cap_csv(bn, "assistant_cap_applied", "assistant_cap_layers",
-                             "assistant_cap_text", output_dir / "assistant_cap_benign.csv")
     bn_cross  = save_cap_csv(bn, "cross_cap_applied", "cross_cap_layers",
                              "cross_cap_text", output_dir / "cross_cap_benign.csv")
 
@@ -409,6 +423,8 @@ def save_results(df, output_dir, args, cos_val, cfg, elapsed):
         "cos_similarity": cos_val,
         "assistant_threshold_method": "optimal (discriminative midpoint)",
         "compliance_threshold_method": "std_jailbreak",
+        "axis_method": cfg.get("AXIS_METHOD", "pca"),
+        "cross_only": cross_only,
     }
     with open(output_dir / "metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
@@ -417,15 +433,18 @@ def save_results(df, output_dir, args, cos_val, cfg, elapsed):
     print(f"Results ({elapsed / 60:.1f} min)")
     print(f"{'=' * 50}")
     print(f"\nJailbreak prompts ({len(jb)}):")
-    print(f"  Assistant cap fired: {(jb['assistant_cap_applied'] == 'Yes').sum()}/{len(jb)}")
+    if not cross_only:
+        print(f"  Assistant cap fired: {(jb['assistant_cap_applied'] == 'Yes').sum()}/{len(jb)}")
     print(f"  Cross cap corrected: {(jb['cross_cap_applied'] == 'Yes').sum()}/{len(jb)}")
     print(f"\nBenign prompts ({len(bn)}):")
-    print(f"  Assistant cap fired: {(bn['assistant_cap_applied'] == 'Yes').sum()}/{len(bn)}")
+    if not cross_only:
+        print(f"  Assistant cap fired: {(bn['assistant_cap_applied'] == 'Yes').sum()}/{len(bn)}")
     print(f"  Cross cap corrected: {(bn['cross_cap_applied'] == 'Yes').sum()}/{len(bn)}")
     print(f"\nSaved to {output_dir}/")
-    print(f"  assistant_cap_jailbreak.csv  ({len(jb_assist)} rows)")
+    if not cross_only:
+        print(f"  assistant_cap_jailbreak.csv  ({len(jb_assist)} rows)")
+        print(f"  assistant_cap_benign.csv     ({len(bn_assist)} rows)")
     print(f"  cross_cap_jailbreak.csv      ({len(jb_cross)} rows)")
-    print(f"  assistant_cap_benign.csv     ({len(bn_assist)} rows)")
     print(f"  cross_cap_benign.csv         ({len(bn_cross)} rows)")
     print(f"  metadata.json")
 
@@ -456,9 +475,14 @@ def do_warmup(args, cfg, output_dir):
     refusing_prompts = load_jbb_behaviors(n_prompts=n_compliance)
     wj_train = load_wildjailbreak_train(n_prompts=n_compliance)
 
-    compliance_axis = compute_pca_compliance_axis(
-        exp, refusing_prompts, wj_train, CAP_LAYERS,
-    )
+    if cfg.get("AXIS_METHOD") == "mean_diff":
+        compliance_axis = compute_mean_diff_compliance_axis(
+            exp, refusing_prompts, wj_train, CAP_LAYERS,
+        )
+    else:
+        compliance_axis = compute_pca_compliance_axis(
+            exp, refusing_prompts, wj_train, CAP_LAYERS,
+        )
 
     cos_val = (compliance_axis @ assistant_axis).item()
     print(f"  cos(assistant, compliance): {cos_val:.4f}")
@@ -540,11 +564,13 @@ def do_chunk(args, cfg, output_dir):
     print(f"  Prompts {start}-{end-1} of {len(prompts)} ({len(chunk_prompts)} in this chunk)")
 
     # 4. Run experiment on this chunk
+    cross_only = cfg.get("CROSS_ONLY", False)
     df = run_experiment(
         exp, chunk_prompts, CAP_LAYERS,
         assistant_axis, compliance_axis,
         assistant_taus, compliance_taus,
         cfg["MAX_NEW_TOKENS"],
+        cross_only=cross_only,
     )
 
     # 5. Save chunk CSV
@@ -586,7 +612,8 @@ def do_merge(args, cfg, output_dir):
     df = pd.concat(dfs, ignore_index=True)
     print(f"  Total rows: {len(df)}")
 
-    save_results(df, output_dir, args, cos_val, cfg, elapsed=0)
+    cross_only = cfg.get("CROSS_ONLY", False)
+    save_results(df, output_dir, args, cos_val, cfg, elapsed=0, cross_only=cross_only)
 
 
 # ============================================================
@@ -613,14 +640,20 @@ def do_run(args, cfg, output_dir):
     refusing_prompts = load_jbb_behaviors(n_prompts=n_compliance)
     wj_train = load_wildjailbreak_train(n_prompts=n_compliance)
 
-    compliance_axis = compute_pca_compliance_axis(
-        exp, refusing_prompts, wj_train, CAP_LAYERS,
-    )
+    if cfg.get("AXIS_METHOD") == "mean_diff":
+        compliance_axis = compute_mean_diff_compliance_axis(
+            exp, refusing_prompts, wj_train, CAP_LAYERS,
+        )
+    else:
+        compliance_axis = compute_pca_compliance_axis(
+            exp, refusing_prompts, wj_train, CAP_LAYERS,
+        )
 
     cos_val = (compliance_axis @ assistant_axis).item()
     print(f"  cos(assistant, compliance): {cos_val:.4f}")
 
     # 4. Load eval prompts
+    cross_only = cfg.get("CROSS_ONLY", False)
     prompts = build_prompts(cfg)
     calibration = CALIBRATION_PROMPTS[:cfg["N_CALIBRATION"]]
 
@@ -651,11 +684,12 @@ def do_run(args, cfg, output_dir):
         assistant_axis, compliance_axis,
         assistant_taus, compliance_taus,
         cfg["MAX_NEW_TOKENS"],
+        cross_only=cross_only,
     )
 
     # 7. Save
     elapsed = time.time() - t_start
-    save_results(df, output_dir, args, cos_val, cfg, elapsed)
+    save_results(df, output_dir, args, cos_val, cfg, elapsed, cross_only=cross_only)
 
 
 # ============================================================

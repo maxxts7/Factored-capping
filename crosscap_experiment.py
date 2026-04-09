@@ -517,6 +517,42 @@ def compute_pca_compliance_axis(
     return pc1.cpu()
 
 
+def compute_mean_diff_compliance_axis(
+    exp: SteeringExperiment,
+    refusing_prompts: list[str],
+    compliant_prompts: list[str],
+    cap_layers: list[int],
+    axis_name: str = "mean_diff_compliance",
+) -> torch.Tensor:
+    """Compliance direction via mean difference (refusing − compliant), L2-normalised."""
+    ref_layer = cap_layers[-1]
+    logger.info(
+        "Computing %s mean-diff compliance axis at L%d (%d refusing, %d compliant)...",
+        axis_name, ref_layer, len(refusing_prompts), len(compliant_prompts),
+    )
+
+    refusing_acts, compliant_acts = [], []
+
+    for prompt in tqdm(refusing_prompts, desc=f"  {axis_name} refusing", leave=False):
+        ids = exp.tokenize(prompt)
+        acts, _ = exp.get_baseline_trajectory(ids)
+        refusing_acts.append(acts[ref_layer].float())
+
+    for prompt in tqdm(compliant_prompts, desc=f"  {axis_name} compliant", leave=False):
+        ids = exp.tokenize(prompt)
+        acts, _ = exp.get_baseline_trajectory(ids)
+        compliant_acts.append(acts[ref_layer].float())
+
+    refusing_stack = torch.stack(refusing_acts)
+    compliant_stack = torch.stack(compliant_acts)
+
+    mean_diff = refusing_stack.mean(0) - compliant_stack.mean(0)
+    mean_diff = mean_diff / mean_diff.norm()
+
+    logger.info("  %s: axis computed (L2-normalised)", axis_name)
+    return mean_diff.cpu()
+
+
 # ---------------------------------------------------------------------------
 # Generation functions
 # ---------------------------------------------------------------------------
