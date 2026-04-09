@@ -11,8 +11,19 @@ Presets:
   small   -- 20 prompts, development
   full    -- 100 prompts, complete run
 
-Run with:
-    python run_crosscap.py [--preset sanity|small|full]
+Single-GPU data parallelism:
+  # Step 1: warmup — downloads everything, computes axes + thresholds
+  python run_crosscap.py --preset full --warmup
+
+  # Step 2: run chunks in parallel (one per GPU)
+  CUDA_VISIBLE_DEVICES=0 python run_crosscap.py --preset full --chunk 0/4 &
+  CUDA_VISIBLE_DEVICES=1 python run_crosscap.py --preset full --chunk 1/4 &
+  CUDA_VISIBLE_DEVICES=2 python run_crosscap.py --preset full --chunk 2/4 &
+  CUDA_VISIBLE_DEVICES=3 python run_crosscap.py --preset full --chunk 3/4 &
+  wait
+
+  # Step 3: merge chunk results into final 4 CSVs
+  python run_crosscap.py --preset full --merge
 """
 
 import argparse
@@ -347,44 +358,11 @@ def run_experiment(
 
 
 # ============================================================
-# MAIN
+# HELPERS
 # ============================================================
 
-def main():
-    args = parse_args()
-    cfg = PRESETS[args.preset]
-    print(f"Preset: {args.preset}")
-
-    t_start = time.time()
-
-    output_dir = Path(args.output_dir or cfg["OUTPUT_DIR"])
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # 1. Load model
-    print(f"\nLoading model: {MODEL_NAME}")
-    exp = SteeringExperiment(MODEL_NAME, axis_path=AXIS_PATH, deterministic=DETERMINISTIC)
-    print(f"  Layers: {exp.num_layers}, Hidden dim: {exp.hidden_dim}")
-    print(f"  Cap layers: L{CAP_LAYERS[0]}-L{CAP_LAYERS[-1]} ({len(CAP_LAYERS)} layers)")
-
-    # 2. Get assistant axis
-    assistant_axis = exp.axis[CAP_LAYERS[-1]].float()
-    assistant_axis = assistant_axis / assistant_axis.norm()
-
-    # 3. Compute compliance axis
-    n_compliance = cfg["N_COMPLIANCE"]
-    print(f"\nBuilding compliance axis ({n_compliance} prompts per side)...")
-    refusing_prompts = load_jbb_behaviors(n_prompts=n_compliance)
-    wj_train = load_wildjailbreak_train(n_prompts=n_compliance)
-
-    compliance_axis = compute_pca_compliance_axis(
-        exp, refusing_prompts, wj_train, CAP_LAYERS,
-    )
-
-    cos_val = (compliance_axis @ assistant_axis).item()
-    print(f"  cos(assistant, compliance): {cos_val:.4f}")
-
-    # 4. Load eval prompts
-    print("\nLoading jailbreak dataset...")
+def build_prompts(cfg):
+    """Load jailbreak + benign prompts and return unified list."""
     behaviors = load_jailbreak_dataset(n_prompts=cfg["N_PROMPTS"])
     calibration = CALIBRATION_PROMPTS[:cfg["N_CALIBRATION"]]
 
@@ -393,39 +371,13 @@ def main():
         prompts.append({"idx": b["id"], "text": b["goal"], "type": "jailbreak"})
     for i, p in enumerate(calibration):
         prompts.append({"idx": i, "text": p, "type": "benign"})
+    return prompts
 
-    # 5. Compute thresholds for both axes
-    print(f"\nComputing thresholds ({len(calibration)} benign, {len(wj_train)} jailbreak)...")
-    axis_directions = {"assistant": assistant_axis, "compliance": compliance_axis}
-    all_thresholds = compute_discriminative_thresholds(
-        exp,
-        benign_prompts=calibration,
-        jailbreak_prompts=wj_train,
-        axis_directions=axis_directions,
-        cap_layers=CAP_LAYERS,
-    )
 
-    # Detection: midpoint threshold on assistant axis
-    assistant_taus = {
-        li: all_thresholds["assistant"][li]["optimal"]
-        for li in CAP_LAYERS
-    }
-    # Correction: std_jailbreak threshold on compliance axis (lower bar)
-    compliance_taus = {
-        li: all_thresholds["compliance"][li]["std_jailbreak"]
-        for li in CAP_LAYERS
-    }
+def save_results(df, output_dir, args, cos_val, cfg, elapsed):
+    """Save 4 CSVs + metadata from a results DataFrame."""
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 6. Run experiment
-    print(f"\nRunning experiment on {len(prompts)} prompts...")
-    df = run_experiment(
-        exp, prompts, CAP_LAYERS,
-        assistant_axis, compliance_axis,
-        assistant_taus, compliance_taus,
-        cfg["MAX_NEW_TOKENS"],
-    )
-
-    # 7. Save 4 CSVs
     jb = df[df["prompt_type"] == "jailbreak"]
     bn = df[df["prompt_type"] == "benign"]
 
@@ -461,9 +413,6 @@ def main():
     with open(output_dir / "metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
 
-    # 8. Summary
-    elapsed = time.time() - t_start
-
     print(f"\n{'=' * 50}")
     print(f"Results ({elapsed / 60:.1f} min)")
     print(f"{'=' * 50}")
@@ -481,6 +430,256 @@ def main():
     print(f"  metadata.json")
 
 
+WARMUP_FILE = "warmup.pt"
+
+
+# ============================================================
+# WARMUP: download everything, compute axes + thresholds, save
+# ============================================================
+
+def do_warmup(args, cfg, output_dir):
+    """Download model/datasets, compute axes and thresholds, save to disk."""
+    print("=== WARMUP: downloading and pre-computing ===\n")
+
+    # 1. Load model (triggers model + axis download)
+    print(f"Loading model: {MODEL_NAME}")
+    exp = SteeringExperiment(MODEL_NAME, axis_path=AXIS_PATH, deterministic=DETERMINISTIC)
+    print(f"  Layers: {exp.num_layers}, Hidden dim: {exp.hidden_dim}")
+
+    # 2. Assistant axis
+    assistant_axis = exp.axis[CAP_LAYERS[-1]].float()
+    assistant_axis = assistant_axis / assistant_axis.norm()
+
+    # 3. Compliance axis (triggers JBB + WJ train downloads)
+    n_compliance = cfg["N_COMPLIANCE"]
+    print(f"\nBuilding compliance axis ({n_compliance} prompts per side)...")
+    refusing_prompts = load_jbb_behaviors(n_prompts=n_compliance)
+    wj_train = load_wildjailbreak_train(n_prompts=n_compliance)
+
+    compliance_axis = compute_pca_compliance_axis(
+        exp, refusing_prompts, wj_train, CAP_LAYERS,
+    )
+
+    cos_val = (compliance_axis @ assistant_axis).item()
+    print(f"  cos(assistant, compliance): {cos_val:.4f}")
+
+    # 4. Load eval prompts (triggers WJ eval download)
+    print("\nLoading jailbreak dataset...")
+    _ = load_jailbreak_dataset(n_prompts=cfg["N_PROMPTS"])
+
+    # 5. Compute thresholds
+    calibration = CALIBRATION_PROMPTS[:cfg["N_CALIBRATION"]]
+    print(f"\nComputing thresholds ({len(calibration)} benign, {len(wj_train)} jailbreak)...")
+    axis_directions = {"assistant": assistant_axis, "compliance": compliance_axis}
+    all_thresholds = compute_discriminative_thresholds(
+        exp,
+        benign_prompts=calibration,
+        jailbreak_prompts=wj_train,
+        axis_directions=axis_directions,
+        cap_layers=CAP_LAYERS,
+    )
+
+    assistant_taus = {
+        li: all_thresholds["assistant"][li]["optimal"]
+        for li in CAP_LAYERS
+    }
+    compliance_taus = {
+        li: all_thresholds["compliance"][li]["std_jailbreak"]
+        for li in CAP_LAYERS
+    }
+
+    # 6. Save pre-computed state
+    warmup_path = output_dir / WARMUP_FILE
+    torch.save({
+        "assistant_axis": assistant_axis,
+        "compliance_axis": compliance_axis,
+        "assistant_taus": assistant_taus,
+        "compliance_taus": compliance_taus,
+        "cos_similarity": cos_val,
+    }, warmup_path)
+
+    print(f"\nWarmup complete. Saved to {warmup_path}")
+    print("You can now run --chunk K/N workers in parallel.")
+
+
+# ============================================================
+# CHUNK: load pre-computed state, process a subset of prompts
+# ============================================================
+
+def do_chunk(args, cfg, output_dir):
+    """Load pre-computed axes/thresholds, run a chunk of prompts."""
+    chunk_str = args.chunk
+    chunk_idx, n_chunks = map(int, chunk_str.split("/"))
+    assert 0 <= chunk_idx < n_chunks, f"Invalid chunk {chunk_str}: need 0 <= {chunk_idx} < {n_chunks}"
+
+    warmup_path = output_dir / WARMUP_FILE
+    if not warmup_path.exists():
+        raise FileNotFoundError(f"{warmup_path} not found. Run --warmup first.")
+
+    print(f"=== CHUNK {chunk_idx}/{n_chunks} ===\n")
+    t_start = time.time()
+
+    # 1. Load pre-computed state
+    state = torch.load(warmup_path, map_location="cpu", weights_only=False)
+    assistant_axis = state["assistant_axis"]
+    compliance_axis = state["compliance_axis"]
+    assistant_taus = state["assistant_taus"]
+    compliance_taus = state["compliance_taus"]
+
+    # 2. Load model
+    print(f"Loading model: {MODEL_NAME}")
+    exp = SteeringExperiment(MODEL_NAME, axis_path=AXIS_PATH, deterministic=DETERMINISTIC)
+
+    # 3. Build prompt list and take this chunk's slice
+    prompts = build_prompts(cfg)
+    chunk_size = (len(prompts) + n_chunks - 1) // n_chunks
+    start = chunk_idx * chunk_size
+    end = min(start + chunk_size, len(prompts))
+    chunk_prompts = prompts[start:end]
+
+    print(f"  Prompts {start}-{end-1} of {len(prompts)} ({len(chunk_prompts)} in this chunk)")
+
+    # 4. Run experiment on this chunk
+    df = run_experiment(
+        exp, chunk_prompts, CAP_LAYERS,
+        assistant_axis, compliance_axis,
+        assistant_taus, compliance_taus,
+        cfg["MAX_NEW_TOKENS"],
+    )
+
+    # 5. Save chunk CSV
+    chunk_dir = output_dir / "chunks"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    chunk_path = chunk_dir / f"chunk_{chunk_idx}.csv"
+    df.to_csv(chunk_path, index=False)
+
+    elapsed = time.time() - t_start
+    print(f"\nChunk {chunk_idx} done in {elapsed / 60:.1f} min. Saved to {chunk_path}")
+
+
+# ============================================================
+# MERGE: concatenate chunk CSVs into final 4 output CSVs
+# ============================================================
+
+def do_merge(args, cfg, output_dir):
+    """Merge chunk CSVs into the final 4 output CSVs."""
+    chunk_dir = output_dir / "chunks"
+    if not chunk_dir.exists():
+        raise FileNotFoundError(f"{chunk_dir} not found. Run --chunk first.")
+
+    warmup_path = output_dir / WARMUP_FILE
+    if not warmup_path.exists():
+        raise FileNotFoundError(f"{warmup_path} not found. Run --warmup first.")
+    state = torch.load(warmup_path, map_location="cpu", weights_only=False)
+    cos_val = state["cos_similarity"]
+
+    chunk_files = list(chunk_dir.glob("chunk_*.csv"))
+    if not chunk_files:
+        print(f"ERROR: No chunk files found in {chunk_dir}")
+        return
+
+    # Sort numerically by chunk index (lexicographic fails for chunk_10 vs chunk_2)
+    chunk_files.sort(key=lambda p: int(p.stem.split("_")[1]))
+
+    print(f"Merging {len(chunk_files)} chunks...")
+    dfs = [pd.read_csv(f) for f in chunk_files]
+    df = pd.concat(dfs, ignore_index=True)
+    print(f"  Total rows: {len(df)}")
+
+    save_results(df, output_dir, args, cos_val, cfg, elapsed=0)
+
+
+# ============================================================
+# SINGLE-PROCESS (no parallelism, original behavior)
+# ============================================================
+
+def do_run(args, cfg, output_dir):
+    """Full single-process run: compute everything and generate."""
+    t_start = time.time()
+
+    # 1. Load model
+    print(f"\nLoading model: {MODEL_NAME}")
+    exp = SteeringExperiment(MODEL_NAME, axis_path=AXIS_PATH, deterministic=DETERMINISTIC)
+    print(f"  Layers: {exp.num_layers}, Hidden dim: {exp.hidden_dim}")
+    print(f"  Cap layers: L{CAP_LAYERS[0]}-L{CAP_LAYERS[-1]} ({len(CAP_LAYERS)} layers)")
+
+    # 2. Get assistant axis
+    assistant_axis = exp.axis[CAP_LAYERS[-1]].float()
+    assistant_axis = assistant_axis / assistant_axis.norm()
+
+    # 3. Compute compliance axis
+    n_compliance = cfg["N_COMPLIANCE"]
+    print(f"\nBuilding compliance axis ({n_compliance} prompts per side)...")
+    refusing_prompts = load_jbb_behaviors(n_prompts=n_compliance)
+    wj_train = load_wildjailbreak_train(n_prompts=n_compliance)
+
+    compliance_axis = compute_pca_compliance_axis(
+        exp, refusing_prompts, wj_train, CAP_LAYERS,
+    )
+
+    cos_val = (compliance_axis @ assistant_axis).item()
+    print(f"  cos(assistant, compliance): {cos_val:.4f}")
+
+    # 4. Load eval prompts
+    prompts = build_prompts(cfg)
+    calibration = CALIBRATION_PROMPTS[:cfg["N_CALIBRATION"]]
+
+    # 5. Compute thresholds for both axes
+    print(f"\nComputing thresholds ({len(calibration)} benign, {len(wj_train)} jailbreak)...")
+    axis_directions = {"assistant": assistant_axis, "compliance": compliance_axis}
+    all_thresholds = compute_discriminative_thresholds(
+        exp,
+        benign_prompts=calibration,
+        jailbreak_prompts=wj_train,
+        axis_directions=axis_directions,
+        cap_layers=CAP_LAYERS,
+    )
+
+    assistant_taus = {
+        li: all_thresholds["assistant"][li]["optimal"]
+        for li in CAP_LAYERS
+    }
+    compliance_taus = {
+        li: all_thresholds["compliance"][li]["std_jailbreak"]
+        for li in CAP_LAYERS
+    }
+
+    # 6. Run experiment
+    print(f"\nRunning experiment on {len(prompts)} prompts...")
+    df = run_experiment(
+        exp, prompts, CAP_LAYERS,
+        assistant_axis, compliance_axis,
+        assistant_taus, compliance_taus,
+        cfg["MAX_NEW_TOKENS"],
+    )
+
+    # 7. Save
+    elapsed = time.time() - t_start
+    save_results(df, output_dir, args, cos_val, cfg, elapsed)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    args = parse_args()
+    cfg = PRESETS[args.preset]
+    output_dir = Path(args.output_dir or cfg["OUTPUT_DIR"])
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Preset: {args.preset}")
+
+    if args.warmup:
+        do_warmup(args, cfg, output_dir)
+    elif args.chunk:
+        do_chunk(args, cfg, output_dir)
+    elif args.merge:
+        do_merge(args, cfg, output_dir)
+    else:
+        do_run(args, cfg, output_dir)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Run cross-axis jailbreak capping experiment",
@@ -492,6 +691,18 @@ def parse_args():
     parser.add_argument(
         "--output-dir", type=str, default=None,
         help="Override the preset's output directory",
+    )
+    parser.add_argument(
+        "--warmup", action="store_true",
+        help="Download model/datasets and pre-compute axes + thresholds",
+    )
+    parser.add_argument(
+        "--chunk", type=str, default=None, metavar="K/N",
+        help="Run chunk K of N (e.g. 0/4). Requires prior --warmup",
+    )
+    parser.add_argument(
+        "--merge", action="store_true",
+        help="Merge chunk CSVs into final output",
     )
     return parser.parse_args()
 
