@@ -35,9 +35,6 @@ crosscap_experiment.py      Core library (model loading, capping hooks, axis mat
 run_crosscap.py             Main script that orchestrates the experiment
 reclassify_refusals.py      Post-hoc LLM judge (sends outputs to Claude Sonnet for labeling)
 run_parallel.sh             Convenience script for multi-GPU runs
-analyze_csvs.py             Prints summary stats from the reclassified CSVs
-analyze_results.sh          Shell wrapper around the analysis
-check_original_csvs.py      Quick sanity check on raw CSVs before reclassification
 requirements.txt            Python dependencies
 Final Results/              CSVs and metadata from the completed experiment
 final_analysis_summary.txt  Plain-text summary of all results
