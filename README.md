@@ -2,7 +2,7 @@
 
 An exploratory study on separating jailbreak detection from correction in LLM activation space.
 
-This project was done as part of the BlueDot AI Safety project sprint. Compute costs were covered by Rapid Grants.
+This project was done as part of the BlueDot Technical AI Safety project sprint. Compute costs were covered by Rapid Grants.
 
 I have tried to explain everything in detail throughout this document and the codebase. If you find any information missing or the structure hard to follow, please reach out to me at manuxtmail@gmail.com.
 
