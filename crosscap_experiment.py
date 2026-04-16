@@ -124,16 +124,22 @@ if not logger.handlers:                     # only configure once, even if impor
 MODEL_CONFIGS = {
     "google/gemma-2-27b-it": {
         "hf_axis_file": "gemma-2-27b/assistant_axis.pt",
+        "hf_capping_config": None,                        # no capping config available
+        "capping_experiment": None,
         "target_layer": 22,
         "num_layers": 46,
     },
     "Qwen/Qwen3-32B": {
         "hf_axis_file": "qwen-3-32b/assistant_axis.pt",
+        "hf_capping_config": "qwen-3-32b/capping_config.pt",
+        "capping_experiment": "layers_46:54-p0.25",
         "target_layer": 32,
         "num_layers": 64,
     },
     "meta-llama/Llama-3.3-70B-Instruct": {
         "hf_axis_file": "llama-3.3-70b/assistant_axis.pt",
+        "hf_capping_config": "llama-3.3-70b/capping_config.pt",
+        "capping_experiment": "layers_56:72-p0.25",
         "target_layer": 40,
         "num_layers": 80,
     },
@@ -169,6 +175,78 @@ def download_axis(model_name: str, cache_dir: str = "results") -> str:
         repo_type="dataset",
         local_dir=cache_dir,
     )
+
+
+def load_original_capping(
+    model_name: str,
+    cache_dir: str = "results",
+) -> tuple[dict[int, torch.Tensor], dict[int, float], list[int]]:
+    """Load the original paper's exact capping vectors and thresholds.
+
+    Downloads the capping_config.pt from HuggingFace and extracts the
+    recommended experiment's per-layer axes and thresholds. The config
+    stores vectors in the negated direction (toward role-playing) with
+    negative thresholds; this function converts them back to the raw
+    assistant-axis direction (toward assistant) with positive thresholds
+    so our floor-based _CappingHook produces identical results.
+
+    Returns:
+        per_layer_axes:       dict mapping layer_idx -> unit vector (raw direction)
+        per_layer_thresholds: dict mapping layer_idx -> threshold (positive)
+        cap_layers:           sorted list of layer indices the experiment covers
+    """
+    cfg = MODEL_CONFIGS[model_name]
+    if cfg["hf_capping_config"] is None:
+        raise ValueError(
+            f"No capping config available for {model_name}. "
+            f"Only Qwen/Qwen3-32B and meta-llama/Llama-3.3-70B-Instruct have configs."
+        )
+
+    config_path = hf_hub_download(
+        repo_id=HF_AXIS_REPO,
+        filename=cfg["hf_capping_config"],
+        repo_type="dataset",
+        local_dir=cache_dir,
+    )
+    config = torch.load(config_path, map_location="cpu", weights_only=False)
+
+    # Find the recommended experiment
+    experiment_id = cfg["capping_experiment"]
+    experiment = None
+    for exp in config["experiments"]:
+        if exp["id"] == experiment_id:
+            experiment = exp
+            break
+    if experiment is None:
+        raise ValueError(f"Experiment '{experiment_id}' not found in capping config")
+
+    per_layer_axes = {}
+    per_layer_thresholds = {}
+    cap_layers = []
+
+    for intervention in experiment["interventions"]:
+        if "cap" not in intervention:
+            continue
+        vec_data = config["vectors"][intervention["vector"]]
+        layer_idx = vec_data["layer"]
+        # Negate: config stores vectors pointing toward role-playing,
+        # we need them pointing toward assistant (raw direction)
+        axis = -vec_data["vector"].float()
+        axis = axis / axis.norm()
+        # Negate threshold: config uses negative values on the negated axis,
+        # equivalent to positive values on the raw axis
+        threshold = -float(intervention["cap"])
+
+        per_layer_axes[layer_idx] = axis
+        per_layer_thresholds[layer_idx] = threshold
+        cap_layers.append(layer_idx)
+
+    cap_layers.sort()
+    logger.info(
+        "Loaded original capping config: experiment=%s, layers=L%d-L%d (%d layers)",
+        experiment_id, cap_layers[0], cap_layers[-1], len(cap_layers),
+    )
+    return per_layer_axes, per_layer_thresholds, cap_layers
 
 
 # ---------------------------------------------------------------------------
@@ -442,15 +520,17 @@ class _CappingHook:
             if self._axis_device is None:
                 self._axis_device = self._axis.to(h.device)
 
-            # Measure: how far does the hidden state project onto the axis?
-            proj = (h[0, -1, :].float() @ self._axis_device.float()).item()
-
-            # If below threshold, the model may be heading toward jailbreak
-            # compliance -- push it back up to the threshold
-            if proj < self._tau:
-                delta = (self._tau - proj) * self._axis_device.to(h.dtype)
-                h[0, -1, :].add_(delta)      # in-place modification
-                self.n_interventions += 1
+            # Cap at every token position (matching the original paper).
+            # During generation with KV-cache, seq_len is 1 (just the new token).
+            # During the prefill pass, seq_len is the full prompt length.
+            axis = self._axis_device.float()
+            h_float = h[0].float()                          # (seq_len, hidden_dim)
+            projs = h_float @ axis                           # (seq_len,) -- projection per position
+            mask = projs < self._tau                          # which positions need capping?
+            if mask.any():
+                deltas = (self._tau - projs[mask]).unsqueeze(-1) * axis  # (n_below, hidden_dim)
+                h[0, mask] += deltas.to(h.dtype)
+                self.n_interventions += int(mask.sum().item())
 
             # Re-pack into the original output format
             if torch.is_tensor(output):
@@ -568,7 +648,7 @@ class _CrossAxisCappingHook:
 def _collect_projections(
     exp: SteeringExperiment,
     prompts: list[str],
-    axis_directions: dict[str, torch.Tensor],
+    axis_directions: dict[str, dict[int, torch.Tensor]],
     cap_layers: list[int],
     max_new_tokens: int = 64,
     label: str = "",
@@ -579,6 +659,9 @@ def _collect_projections(
     This is a helper used by compute_discriminative_thresholds -- it
     generates text for each prompt while tracking projections, then
     returns all the recorded values so we can compute statistics.
+
+    Args:
+        axis_directions: maps axis_name -> layer_idx -> unit vector for that layer.
 
     Returns:
         projs[axis_name][layer_idx] = list of floats (one per generation step
@@ -593,12 +676,13 @@ def _collect_projections(
     for prompt in tqdm(prompts, desc=desc, leave=False):
         input_ids = exp.tokenize(prompt)
 
-        # Attach a tracker to every (axis, layer) pair
+        # Attach a tracker to every (axis, layer) pair, using the
+        # layer-specific axis vector for each
         with ExitStack() as stack:
             trackers: dict[tuple, _AxisProjectionTracker] = {}
-            for axis_name, axis_unit in axis_directions.items():
+            for axis_name, per_layer in axis_directions.items():
                 for layer_idx in cap_layers:
-                    t = _AxisProjectionTracker(exp.layers[layer_idx], axis_unit)
+                    t = _AxisProjectionTracker(exp.layers[layer_idx], per_layer[layer_idx])
                     stack.enter_context(t)
                     trackers[(axis_name, layer_idx)] = t
 
@@ -622,7 +706,7 @@ def compute_discriminative_thresholds(
     exp: SteeringExperiment,
     benign_prompts: list[str],
     jailbreak_prompts: list[str],
-    axis_directions: dict[str, torch.Tensor],
+    axis_directions: dict[str, dict[int, torch.Tensor]],
     cap_layers: list[int],
     max_new_tokens: int = 64,
 ) -> dict[str, dict[int, dict[str, float]]]:
@@ -675,8 +759,10 @@ def compute_discriminative_thresholds(
             mean_b, mean_j = float(b_arr.mean()), float(j_arr.mean())
             tau = (mean_b + mean_j) / 2.0     # midpoint = decision boundary
             separation = mean_b - mean_j       # how well-separated the two classes are
+            combined = np.concatenate([b_arr, j_arr])
             thresholds[axis_name][layer_idx] = {
                 "optimal":        tau,
+                "p25":            float(np.percentile(combined, 25)),
                 "mean_benign":    mean_b,
                 "mean_jailbreak": mean_j,
                 "std_benign":     float(b_arr.std()),
@@ -865,18 +951,21 @@ def compute_mean_diff_compliance_axis(
 def generate_baseline(
     exp: SteeringExperiment,
     input_ids: torch.Tensor,
-    axis_directions: dict[str, torch.Tensor],   # axes to monitor (not used for capping)
+    axis_directions: dict[str, dict[int, torch.Tensor]],   # axes to monitor (not used for capping)
     track_layers: list[int],                     # which layers to record projections at
     max_new_tokens: int = 128,
     temperature: float = 1.0,
     do_sample: bool = False,                     # False = greedy decoding (deterministic)
 ) -> tuple:
-    
+
 
     """Generate text with NO capping -- this is the control condition.
 
     We still attach projection trackers so we can compare how the model's
     internal state differs between capped and uncapped runs.
+
+    Args:
+        axis_directions: maps axis_name -> layer_idx -> unit vector for that layer.
 
     Returns:
         sequences:  the generated token IDs
@@ -889,9 +978,9 @@ def generate_baseline(
     with ExitStack() as stack:
         # Attach read-only trackers to monitor projections (no intervention)
         trackers: dict[tuple, _AxisProjectionTracker] = {}
-        for axis_name, axis_unit in axis_directions.items():
+        for axis_name, per_layer in axis_directions.items():
             for layer_idx in track_layers:
-                t = _AxisProjectionTracker(exp.layers[layer_idx], axis_unit)
+                t = _AxisProjectionTracker(exp.layers[layer_idx], per_layer[layer_idx])
                 stack.enter_context(t)
                 trackers[(axis_name, layer_idx)] = t
 
@@ -927,7 +1016,7 @@ def generate_capped(
     exp: SteeringExperiment,
     input_ids: torch.Tensor,
     cap_layers: list[int],                       # which layers to apply capping at
-    axis_unit: torch.Tensor,                     # the assistant axis (used for both detect + correct)
+    per_layer_axes: dict[int, torch.Tensor],     # per-layer assistant axis vectors
     per_layer_thresholds: dict[int, float],       # threshold per layer
     track_layers: list[int],                     # which layers to track projections at
     max_new_tokens: int = 128,
@@ -940,7 +1029,8 @@ def generate_capped(
 
     This is the baseline capping method: at each generation step, every
     cap layer checks if the hidden state's projection onto the assistant axis
-    is below threshold, and nudges it back up if so.
+    is below threshold, and nudges it back up if so. Each layer uses its own
+    axis vector (matching the original paper's per-layer extraction).
 
     Returns:
         sequences:        generated token IDs
@@ -952,9 +1042,9 @@ def generate_capped(
 
 
 
-    # Create one capping hook per cap layer, each with its own threshold
+    # Create one capping hook per cap layer, each with its own axis and threshold
     cap_hooks = [
-        _CappingHook(exp.layers[layer_idx], axis_unit, per_layer_thresholds[layer_idx])
+        _CappingHook(exp.layers[layer_idx], per_layer_axes[layer_idx], per_layer_thresholds[layer_idx])
         for layer_idx in cap_layers
     ]
 
@@ -966,7 +1056,7 @@ def generate_capped(
         # Also attach read-only trackers so we can see the post-cap projections
         trackers: dict[int, _AxisProjectionTracker] = {}
         for layer_idx in track_layers:
-            t = _AxisProjectionTracker(exp.layers[layer_idx], axis_unit)
+            t = _AxisProjectionTracker(exp.layers[layer_idx], per_layer_axes[layer_idx])
             stack.enter_context(t)
             trackers[layer_idx] = t
 
@@ -996,12 +1086,12 @@ def generate_cross_capped(
     exp: SteeringExperiment,
     input_ids: torch.Tensor,
     cap_layers: list[int],
-    detect_axis: torch.Tensor,                   # assistant axis -- used to decide IF we intervene
+    per_layer_detect_axes: dict[int, torch.Tensor],  # per-layer assistant axes for detection
     correct_axis: torch.Tensor,                  # compliance axis -- used for the actual correction
     detect_thresholds: dict[int, float],          # per-layer thresholds for detection
     correct_thresholds: dict[int, float],         # per-layer thresholds for correction
     track_layers: list[int],
-    track_axis: torch.Tensor,                    # which axis to monitor in the trackers
+    per_layer_track_axes: dict[int, torch.Tensor],   # per-layer axes for monitoring
     max_new_tokens: int = 128,
     temperature: float = 1.0,
     do_sample: bool = False,
@@ -1015,6 +1105,9 @@ def generate_cross_capped(
       2. If yes, check the compliance axis -- is correction needed? (gating)
       3. If yes, nudge the hidden state along the compliance axis. (correction)
 
+    Each layer uses its own assistant axis vector for detection (matching the
+    original paper's per-layer extraction).
+
     Returns:
         sequences:        generated token IDs
         scores:           per-step logit distributions
@@ -1025,13 +1118,13 @@ def generate_cross_capped(
     """
 
 
-    
+
     # Create one cross-axis hook per cap layer
     hooks = [
         _CrossAxisCappingHook(
             exp.layers[layer_idx],
-            detect_axis, detect_thresholds[layer_idx],     # gate: assistant axis
-            correct_axis, correct_thresholds[layer_idx],   # correction: compliance axis
+            per_layer_detect_axes[layer_idx], detect_thresholds[layer_idx],  # gate: assistant axis
+            correct_axis, correct_thresholds[layer_idx],                     # correction: compliance axis
         )
         for layer_idx in cap_layers
     ]
@@ -1044,7 +1137,7 @@ def generate_cross_capped(
         # Attach trackers for monitoring
         trackers: dict[int, _AxisProjectionTracker] = {}
         for layer_idx in track_layers:
-            t = _AxisProjectionTracker(exp.layers[layer_idx], track_axis)
+            t = _AxisProjectionTracker(exp.layers[layer_idx], per_layer_track_axes[layer_idx])
             stack.enter_context(t)
             trackers[layer_idx] = t
 
