@@ -336,7 +336,7 @@ def load_alpaca_eval(n_prompts=None):
     """
     from datasets import load_dataset
     logger.info("Loading tatsu-lab/alpaca_eval...")
-    ds = load_dataset("tatsu-lab/alpaca_eval", "alpaca_eval")
+    ds = load_dataset("tatsu-lab/alpaca_eval", "alpaca_eval", trust_remote_code=True)
     split = "eval" if "eval" in ds else list(ds.keys())[0]
     prompts = [row["instruction"] for row in ds[split]]
     if n_prompts is not None:
