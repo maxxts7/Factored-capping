@@ -435,6 +435,10 @@ def run_experiment(
     track_layers = sorted({cap_layers[-1], final_layer})      # monitor projections at these layers
     axis_directions = {"assistant": assistant_axes}            # axes to track during baseline
 
+    # Create relaxed assistant thresholds for cross-axis capping
+    # Cross-axis has two gates, so detection gate can be more permissive
+    relaxed_assistant_taus = create_relaxed_assistant_thresholds(assistant_taus, relaxation_factor=2.0)
+
     rows = []
 
     for i, prompt in enumerate(prompts):
@@ -487,9 +491,9 @@ def run_experiment(
         try:
             cross_ids, _, _, n_triggered, n_corrected, cross_active = generate_cross_capped(
                 exp, input_ids, cap_layers,
-                per_layer_detect_axes=assistant_axes,  # "is this a jailbreak?" (gate)
-                correct_axes=compliance_axes,          # "push toward refusal" (correction)
-                detect_thresholds=assistant_taus,
+                per_layer_detect_axes=assistant_axes,     # "is this a jailbreak?" (gate)
+                correct_axes=compliance_axes,             # "push toward refusal" (correction)
+                detect_thresholds=relaxed_assistant_taus, # Use relaxed thresholds for detection
                 correct_thresholds=compliance_taus,
                 track_layers=track_layers,
                 per_layer_track_axes=assistant_axes,
@@ -548,6 +552,27 @@ def _compliance_tau(stats: dict, method: str) -> float:
         # Not available from compliance stats -- fall back to midpoint
         return stats["optimal"]
     raise ValueError(f"Unknown compliance threshold method: {method}")
+
+
+def create_relaxed_assistant_thresholds(original_taus: dict[int, float], relaxation_factor: float = 2.0) -> dict[int, float]:
+    """Create relaxed assistant thresholds for cross-axis capping.
+
+    Cross-axis capping has two gates, so the detection gate can be more permissive.
+    Higher thresholds = less aggressive = fewer false positives on benign prompts.
+
+    Args:
+        original_taus: Original assistant axis thresholds from the paper
+        relaxation_factor: Multiplicative factor to make thresholds less aggressive
+
+    Returns:
+        Relaxed thresholds for cross-axis detection gate
+    """
+    relaxed_taus = {
+        layer_idx: original_tau * relaxation_factor
+        for layer_idx, original_tau in original_taus.items()
+    }
+    logger.info("Created relaxed assistant thresholds with factor %.1f", relaxation_factor)
+    return relaxed_taus
 
 
 def build_prompts(cfg):
