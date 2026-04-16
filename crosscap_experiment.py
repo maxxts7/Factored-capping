@@ -229,9 +229,9 @@ def load_original_capping(
             continue
         vec_data = config["vectors"][intervention["vector"]]
         layer_idx = vec_data["layer"]
-        # FIX: Original comment was wrong - vectors already point toward assistant
-        # Don't negate them or they'll point toward role-playing
-        axis = vec_data["vector"].float()
+        # Negate: config stores vectors pointing toward role-playing,
+        # we need them pointing toward assistant (raw direction)
+        axis = -vec_data["vector"].float()
         axis = axis / axis.norm()
         # Negate threshold: config uses negative values on the negated axis,
         # equivalent to positive values on the raw axis
@@ -809,16 +809,21 @@ def compute_pca_compliance_axis(
     compliant_prompts: list[str],      # prompts the model complies with (e.g. jailbreaks that work)
     cap_layers: list[int],
     axis_name: str = "pca_compliance",
-) -> tuple[dict[int, torch.Tensor], dict[int, list[torch.Tensor]], dict[int, list[torch.Tensor]]]:
-    """Build per-layer compliance axes via PCA.
+) -> tuple[dict[int, torch.Tensor], dict[int, dict[str, float]]]:
+    """Build per-layer compliance axes via PCA and compute thresholds.
 
     Runs PCA separately at each cap layer, producing a different compliance
-    direction for each layer.
+    direction for each layer. Also computes threshold stats from the same
+    refusing/compliant activations used to build the axis — no separate
+    calibration data needed.
 
     Returns:
-        per_layer_axes: dict mapping layer_idx -> unit vector on CPU
-        refusing_acts: dict mapping layer_idx -> list of refusing activation tensors
-        compliant_acts: dict mapping layer_idx -> list of compliant activation tensors
+        per_layer_axes:  dict mapping layer_idx -> unit vector on CPU
+        per_layer_stats: dict mapping layer_idx -> {
+            "mean_refusing", "mean_compliant", "std_refusing", "std_compliant",
+            "optimal" (midpoint), "mean+std" (mean_compliant + std_compliant),
+            "separation", "var_explained"
+        }
     """
     logger.info(
         "Computing %s PCA compliance axes at L%d-L%d (%d refusing, %d compliant)...",
@@ -844,6 +849,7 @@ def compute_pca_compliance_axis(
 
     # --- Run PCA at each cap layer separately ---
     per_layer_axes = {}
+    per_layer_stats = {}
     for li in cap_layers:
         refusing_stack  = torch.stack(refusing_acts[li])
         compliant_stack = torch.stack(compliant_acts[li])
@@ -861,9 +867,32 @@ def compute_pca_compliance_axis(
         pc1 = pc1 / pc1.norm()
         var_explained = (S[0] ** 2 / (S ** 2).sum()).item() * 100
         per_layer_axes[li] = pc1.cpu()
-        logger.info("  %s L%d: var_explained=%.1f%%", axis_name, li, var_explained)
 
-    return per_layer_axes, refusing_acts, compliant_acts
+        # --- Compute threshold stats from refusing/compliant projections ---
+        # On this axis: high = refusing (safe), low = compliant (unsafe)
+        refusing_projs = (refusing_stack @ pc1).numpy()
+        compliant_projs = (compliant_stack @ pc1).numpy()
+        mean_r = float(refusing_projs.mean())
+        mean_c = float(compliant_projs.mean())
+        std_r = float(refusing_projs.std())
+        std_c = float(compliant_projs.std())
+        per_layer_stats[li] = {
+            "mean_refusing":  mean_r,
+            "mean_compliant": mean_c,
+            "std_refusing":   std_r,
+            "std_compliant":  std_c,
+            "optimal":        (mean_r + mean_c) / 2.0,
+            "mean+std":       mean_c + std_c,
+            "separation":     mean_r - mean_c,
+            "var_explained":  var_explained,
+        }
+        logger.info(
+            "  %s L%d: var=%.1f%%  refusing=%.1f+/-%.1f  compliant=%.1f+/-%.1f  sep=%.1f",
+            axis_name, li, var_explained, mean_r, std_r, mean_c, std_c,
+            mean_r - mean_c,
+        )
+
+    return per_layer_axes, per_layer_stats, refusing_acts, compliant_acts
 
 
 def compute_mean_diff_compliance_axis(
@@ -872,16 +901,16 @@ def compute_mean_diff_compliance_axis(
     compliant_prompts: list[str],
     cap_layers: list[int],
     axis_name: str = "mean_diff_compliance",
-) -> tuple[dict[int, torch.Tensor], dict[int, list[torch.Tensor]], dict[int, list[torch.Tensor]]]:
+) -> tuple[dict[int, torch.Tensor], dict[int, dict[str, float]]]:
     """Simpler alternative: compliance axis = (mean_refusing - mean_compliant).
 
-    Computed per-layer. Less principled than PCA but faster and sometimes
-    works just as well. Each result is L2-normalised to unit length.
+    Computed per-layer, with threshold stats derived from the same data.
+    Less principled than PCA but faster and sometimes works just as well.
+    Each result is L2-normalised to unit length.
 
     Returns:
-        per_layer_axes: dict mapping layer_idx -> unit vector on CPU
-        refusing_acts: dict mapping layer_idx -> list of refusing activation tensors
-        compliant_acts: dict mapping layer_idx -> list of compliant activation tensors
+        per_layer_axes:  dict mapping layer_idx -> unit vector on CPU
+        per_layer_stats: dict mapping layer_idx -> threshold stats (same format as PCA)
     """
     logger.info(
         "Computing %s mean-diff compliance axes at L%d-L%d (%d refusing, %d compliant)...",
@@ -905,30 +934,58 @@ def compute_mean_diff_compliance_axis(
             compliant_acts[li].append(acts[li].float())
 
     per_layer_axes = {}
+    per_layer_stats = {}
     for li in cap_layers:
         refusing_stack = torch.stack(refusing_acts[li])
         compliant_stack = torch.stack(compliant_acts[li])
         md = refusing_stack.mean(0) - compliant_stack.mean(0)
         md = md / md.norm()
         per_layer_axes[li] = md.cpu()
-        logger.info("  %s L%d: axis computed (L2-normalised)", axis_name, li)
 
-    return per_layer_axes, refusing_acts, compliant_acts
+        # Threshold stats from projections onto this axis
+        refusing_projs = (refusing_stack @ md).numpy()
+        compliant_projs = (compliant_stack @ md).numpy()
+        mean_r = float(refusing_projs.mean())
+        mean_c = float(compliant_projs.mean())
+        std_r = float(refusing_projs.std())
+        std_c = float(compliant_projs.std())
+        per_layer_stats[li] = {
+            "mean_refusing":  mean_r,
+            "mean_compliant": mean_c,
+            "std_refusing":   std_r,
+            "std_compliant":  std_c,
+            "optimal":        (mean_r + mean_c) / 2.0,
+            "mean+std":       mean_c + std_c,
+            "separation":     mean_r - mean_c,
+        }
+        logger.info(
+            "  %s L%d: refusing=%.1f+/-%.1f  compliant=%.1f+/-%.1f  sep=%.1f",
+            axis_name, li, mean_r, std_r, mean_c, std_c, mean_r - mean_c,
+        )
+
+    return per_layer_axes, per_layer_stats, refusing_acts, compliant_acts
 
 
 def orthogonalize_compliance_axes(
     exp: SteeringExperiment,
     compliance_axes: dict[int, torch.Tensor],
     benign_prompts: list[str],
+    refusing_acts: dict[int, list[torch.Tensor]],
+    compliant_acts: dict[int, list[torch.Tensor]],
     cap_layers: list[int],
-) -> dict[int, torch.Tensor]:
+) -> tuple[dict[int, torch.Tensor], dict[int, dict[str, float]]]:
     """Remove the benign component from compliance axes.
 
     Projects out the mean benign activation direction from each compliance
     axis. The resulting vector can still push toward refusal but has zero
     projection onto the direction that benign prompts naturally occupy.
 
-    Returns dict mapping layer_idx -> orthogonalized unit vector.
+    Reuses the refusing/compliant activations already collected during
+    axis construction to recompute threshold stats on the new axes.
+
+    Returns:
+        orth_axes:       dict mapping layer_idx -> orthogonalized unit vector
+        orth_stats:      dict mapping layer_idx -> threshold stats
     """
     logger.info(
         "Orthogonalizing compliance axes against benign direction "
@@ -936,6 +993,7 @@ def orthogonalize_compliance_axes(
         len(benign_prompts), cap_layers[0], cap_layers[-1],
     )
 
+    # Only need to collect benign activations — refusing/compliant are reused
     benign_acts = {li: [] for li in cap_layers}
     for prompt in tqdm(benign_prompts, desc="  Benign activations", leave=False):
         ids = exp.tokenize(prompt)
@@ -944,10 +1002,12 @@ def orthogonalize_compliance_axes(
             benign_acts[li].append(acts[li].float())
 
     orth_axes = {}
+    orth_stats = {}
     for li in cap_layers:
         benign_stack = torch.stack(benign_acts[li])
 
         # Benign direction = mean benign activation (normalized).
+        # This is the direction we want to protect from capping.
         benign_dir = benign_stack.mean(dim=0).float()
         benign_dir = benign_dir / benign_dir.norm()
 
@@ -958,66 +1018,16 @@ def orthogonalize_compliance_axes(
         orth = orth / orth.norm()
         orth_axes[li] = orth.cpu()
 
-        logger.info(
-            "  L%d: cos(compliance, benign)=%.3f -> %.6f",
-            li, overlap, (orth @ benign_dir).item(),
-        )
-
-    return orth_axes
-
-
-def compute_compliance_thresholds(
-    exp: SteeringExperiment,
-    compliance_axes: dict[int, torch.Tensor],
-    refusing_prompts: list[str],
-    compliant_prompts: list[str],
-    cap_layers: list[int],
-) -> dict[int, dict[str, float]]:
-    """Compute per-layer threshold stats for the compliance axis.
-
-    Projects refusing and compliant activations onto the given compliance
-    axes and computes distribution stats. Call this AFTER axis construction
-    and any orthogonalization, so thresholds are on the final axes.
-
-    Returns dict mapping layer_idx -> {
-        "mean_refusing", "mean_compliant", "std_refusing", "std_compliant",
-        "optimal" (midpoint), "mean+std" (mean_compliant + std_compliant),
-        "separation"
-    }
-    """
-    logger.info(
-        "Computing compliance thresholds at L%d-L%d (%d refusing, %d compliant)...",
-        cap_layers[0], cap_layers[-1],
-        len(refusing_prompts), len(compliant_prompts),
-    )
-
-    refusing_acts = {li: [] for li in cap_layers}
-    compliant_acts = {li: [] for li in cap_layers}
-
-    for prompt in tqdm(refusing_prompts, desc="  Refusing", leave=False):
-        ids = exp.tokenize(prompt)
-        acts, _ = exp.get_baseline_trajectory(ids)
-        for li in cap_layers:
-            refusing_acts[li].append(acts[li].float())
-
-    for prompt in tqdm(compliant_prompts, desc="  Compliant", leave=False):
-        ids = exp.tokenize(prompt)
-        acts, _ = exp.get_baseline_trajectory(ids)
-        for li in cap_layers:
-            compliant_acts[li].append(acts[li].float())
-
-    stats = {}
-    for li in cap_layers:
-        axis = compliance_axes[li].float()
+        # Recompute threshold stats on the orthogonalized axis
         refusing_stack = torch.stack(refusing_acts[li])
         compliant_stack = torch.stack(compliant_acts[li])
-        r_projs = (refusing_stack @ axis).numpy()
-        c_projs = (compliant_stack @ axis).numpy()
-        mean_r = float(r_projs.mean())
-        mean_c = float(c_projs.mean())
-        std_r = float(r_projs.std())
-        std_c = float(c_projs.std())
-        stats[li] = {
+        refusing_projs = (refusing_stack @ orth).numpy()
+        compliant_projs = (compliant_stack @ orth).numpy()
+        mean_r = float(refusing_projs.mean())
+        mean_c = float(compliant_projs.mean())
+        std_r = float(refusing_projs.std())
+        std_c = float(compliant_projs.std())
+        orth_stats[li] = {
             "mean_refusing":  mean_r,
             "mean_compliant": mean_c,
             "std_refusing":   std_r,
@@ -1026,12 +1036,13 @@ def compute_compliance_thresholds(
             "mean+std":       mean_c + std_c,
             "separation":     mean_r - mean_c,
         }
+
         logger.info(
-            "  L%d: refusing=%.1f+/-%.1f  compliant=%.1f+/-%.1f  sep=%.1f",
-            li, mean_r, std_r, mean_c, std_c, mean_r - mean_c,
+            "  L%d: cos(comp,benign)=%.3f -> %.6f  sep=%.1f",
+            li, overlap, (orth @ benign_dir).item(), mean_r - mean_c,
         )
 
-    return stats
+    return orth_axes, orth_stats
 
 
 # ---------------------------------------------------------------------------

@@ -87,7 +87,6 @@ from crosscap_experiment import (
     compute_pca_compliance_axis,            # builds compliance axis via PCA
     compute_mean_diff_compliance_axis,      # builds compliance axis via mean difference
     orthogonalize_compliance_axes,          # remove benign component from compliance axes
-    compute_compliance_thresholds,          # compute thresholds after orthogonalization
     generate_baseline,                      # uncapped generation (control)
     generate_capped,                        # single-axis capping
     generate_cross_capped,                  # cross-axis capping (the new method)
@@ -121,14 +120,14 @@ logger = logging.getLogger("crosscap")
 # ============================================================
 
 PRESETS = {
-    # Quick smoke test: 10 prompts, full-length output -- verifies the code runs
+    # Quick smoke test: 10 prompts, tiny output -- verifies the code runs
     # with reliable axis/thresholds (50 calibration + 50 compliance)
     "sanity": {
         "N_PROMPTS": 10,
         "N_CALIBRATION": 50,
         "N_COMPLIANCE": 50,
         "N_BENIGN_EVAL": 10,
-        "MAX_NEW_TOKENS": 256,
+        "MAX_NEW_TOKENS": 64,
         "OUTPUT_DIR": "results/crosscap_sanity",
     },
     # Development preset: enough prompts to see patterns, fast enough to iterate
@@ -435,10 +434,6 @@ def run_experiment(
     track_layers = sorted({cap_layers[-1], final_layer})      # monitor projections at these layers
     axis_directions = {"assistant": assistant_axes}            # axes to track during baseline
 
-    # Create relaxed assistant thresholds for cross-axis capping
-    # Cross-axis has two gates, so detection gate can be more permissive
-    relaxed_assistant_taus = create_relaxed_assistant_thresholds(assistant_taus, relaxation_factor=2.0)
-
     rows = []
 
     for i, prompt in enumerate(prompts):
@@ -491,9 +486,9 @@ def run_experiment(
         try:
             cross_ids, _, _, n_triggered, n_corrected, cross_active = generate_cross_capped(
                 exp, input_ids, cap_layers,
-                per_layer_detect_axes=assistant_axes,     # "is this a jailbreak?" (gate)
-                correct_axes=compliance_axes,             # "push toward refusal" (correction)
-                detect_thresholds=relaxed_assistant_taus, # Use relaxed thresholds for detection
+                per_layer_detect_axes=assistant_axes,  # "is this a jailbreak?" (gate)
+                correct_axes=compliance_axes,          # "push toward refusal" (correction)
+                detect_thresholds=assistant_taus,
                 correct_thresholds=compliance_taus,
                 track_layers=track_layers,
                 per_layer_track_axes=assistant_axes,
@@ -552,27 +547,6 @@ def _compliance_tau(stats: dict, method: str) -> float:
         # Not available from compliance stats -- fall back to midpoint
         return stats["optimal"]
     raise ValueError(f"Unknown compliance threshold method: {method}")
-
-
-def create_relaxed_assistant_thresholds(original_taus: dict[int, float], relaxation_factor: float = 2.0) -> dict[int, float]:
-    """Create relaxed assistant thresholds for cross-axis capping.
-
-    Cross-axis capping has two gates, so the detection gate can be more permissive.
-    Higher thresholds = less aggressive = fewer false positives on benign prompts.
-
-    Args:
-        original_taus: Original assistant axis thresholds from the paper
-        relaxation_factor: Multiplicative factor to make thresholds less aggressive
-
-    Returns:
-        Relaxed thresholds for cross-axis detection gate
-    """
-    relaxed_taus = {
-        layer_idx: original_tau * relaxation_factor
-        for layer_idx, original_tau in original_taus.items()
-    }
-    logger.info("Created relaxed assistant thresholds with factor %.1f", relaxation_factor)
-    return relaxed_taus
 
 
 def build_prompts(cfg):
@@ -707,9 +681,9 @@ def do_warmup(args, cfg, output_dir):
     # the exact same vectors and thresholds the original paper used.
     print("\nLoading original capping config...")
     assistant_axes, assistant_taus, original_cap_layers = load_original_capping(MODEL_NAME)
-    # Use the cap layers from the original paper
-    cap_layers = original_cap_layers
-    print(f"  Cap layers from original paper: L{cap_layers[0]}-L{cap_layers[-1]}")
+    # Override CAP_LAYERS with whatever the original paper used
+    CAP_LAYERS[:] = original_cap_layers
+    print(f"  Cap layers from original paper: L{CAP_LAYERS[0]}-L{CAP_LAYERS[-1]}")
     # Add the final layer for tracking (not capping)
     final_layer = exp.num_layers - 1
     if final_layer not in assistant_axes:
@@ -725,42 +699,40 @@ def do_warmup(args, cfg, output_dir):
     wj_train = load_wildjailbreak_train(n_prompts=n_compliance)      # model complies with these
 
     if cfg.get("AXIS_METHOD") == "mean_diff":
-        compliance_axes, refusing_acts, compliant_acts = compute_mean_diff_compliance_axis(
-            exp, refusing_prompts, wj_train, cap_layers,
+        compliance_axes, compliance_stats, refusing_acts, compliant_acts = compute_mean_diff_compliance_axis(
+            exp, refusing_prompts, wj_train, CAP_LAYERS,
         )
     else:
-        compliance_axes, refusing_acts, compliant_acts = compute_pca_compliance_axis(
-            exp, refusing_prompts, wj_train, cap_layers,
+        compliance_axes, compliance_stats, refusing_acts, compliant_acts = compute_pca_compliance_axis(
+            exp, refusing_prompts, wj_train, CAP_LAYERS,
         )
 
     # Optional: orthogonalize compliance axes against benign direction
     if cfg.get("ORTHOGONALIZE", False):
         calibration = CALIBRATION_PROMPTS[:cfg["N_CALIBRATION"]]
-        compliance_axes = orthogonalize_compliance_axes(
-            exp, compliance_axes, calibration, cap_layers,
+        compliance_axes, compliance_stats = orthogonalize_compliance_axes(
+            exp, compliance_axes, calibration,
+            refusing_acts, compliant_acts, CAP_LAYERS,
         )
 
     # How similar are the two axes? Low cosine = they point in different directions
-    cos_val = (compliance_axes[cap_layers[-1]] @ assistant_axes[cap_layers[-1]]).item()
-    print(f"  cos(assistant, compliance) at L{cap_layers[-1]}: {cos_val:.4f}")
+    cos_val = (compliance_axes[CAP_LAYERS[-1]] @ assistant_axes[CAP_LAYERS[-1]]).item()
+    print(f"  cos(assistant, compliance) at L{CAP_LAYERS[-1]}: {cos_val:.4f}")
 
     # Step 4: Pre-download eval datasets so chunk workers don't race to download them
     print("\nPre-downloading eval datasets...")
     _ = load_jailbreak_dataset(n_prompts=cfg["N_PROMPTS"])
     _ = load_alpaca_eval(n_prompts=cfg["N_BENIGN_EVAL"])
 
-    # Step 5: Compute compliance thresholds from the FINAL axes (after orthogonalization)
-    print("\nComputing compliance thresholds on final axes...")
-    compliance_stats = compute_compliance_thresholds(
-        exp, compliance_axes, refusing_prompts, wj_train, cap_layers
-    )
-    threshold_method = cfg.get("COMPLIANCE_THRESHOLD", "mean+std")
+    # Step 5: Compute compliance thresholds from the refusing/compliant projection
+    # stats that were computed alongside the axis (no separate calibration needed).
+    threshold_method = cfg["COMPLIANCE_THRESHOLD"]
     compliance_taus = {
         li: _compliance_tau(compliance_stats[li], threshold_method)
-        for li in cap_layers
+        for li in CAP_LAYERS
     }
     print(f"\nCompliance thresholds ({threshold_method}):")
-    for li in [cap_layers[0], cap_layers[-1]]:
+    for li in [CAP_LAYERS[0], CAP_LAYERS[-1]]:
         s = compliance_stats[li]
         print(f"  L{li}: tau={compliance_taus[li]:.1f}  "
               f"refusing={s['mean_refusing']:.1f}+/-{s['std_refusing']:.1f}  "
@@ -775,7 +747,6 @@ def do_warmup(args, cfg, output_dir):
         "assistant_taus": assistant_taus,
         "compliance_taus": compliance_taus,
         "cos_similarity": cos_val,
-        "cap_layers": cap_layers,  # Save the cap layers for chunk workers
     }, warmup_path)
 
     print(f"\nWarmup complete. Saved to {warmup_path}")
@@ -819,7 +790,6 @@ def do_chunk(args, cfg, output_dir):
     compliance_axes = state["compliance_axes"]
     assistant_taus = state["assistant_taus"]
     compliance_taus = state["compliance_taus"]
-    cap_layers = state.get("cap_layers", CAP_LAYERS)  # Use saved cap_layers or fallback
 
     # Step 2: Load the model (each chunk worker needs its own copy in GPU memory)
     print(f"Loading model: {MODEL_NAME}")
@@ -837,7 +807,7 @@ def do_chunk(args, cfg, output_dir):
     # Step 4: Run the experiment on this chunk's prompts
     cross_only = cfg.get("CROSS_ONLY", False)
     df = run_experiment(
-        exp, chunk_prompts, cap_layers,
+        exp, chunk_prompts, CAP_LAYERS,
         assistant_axes, compliance_axes,
         assistant_taus, compliance_taus,
         cfg["MAX_NEW_TOKENS"],
@@ -918,8 +888,8 @@ def do_run(args, cfg, output_dir):
     # Step 2: Load the original paper's exact capping vectors and thresholds
     print("\nLoading original capping config...")
     assistant_axes, assistant_taus, original_cap_layers = load_original_capping(MODEL_NAME)
-    cap_layers = original_cap_layers
-    print(f"  Cap layers from original paper: L{cap_layers[0]}-L{cap_layers[-1]}")
+    CAP_LAYERS[:] = original_cap_layers
+    print(f"  Cap layers from original paper: L{CAP_LAYERS[0]}-L{CAP_LAYERS[-1]}")
     final_layer = exp.num_layers - 1
     if final_layer not in assistant_axes:
         ax = exp.axis[final_layer].float()
@@ -932,40 +902,37 @@ def do_run(args, cfg, output_dir):
     wj_train = load_wildjailbreak_train(n_prompts=n_compliance)
 
     if cfg.get("AXIS_METHOD") == "mean_diff":
-        compliance_axes, refusing_acts, compliant_acts = compute_mean_diff_compliance_axis(
-            exp, refusing_prompts, wj_train, cap_layers,
+        compliance_axes, compliance_stats, refusing_acts, compliant_acts = compute_mean_diff_compliance_axis(
+            exp, refusing_prompts, wj_train, CAP_LAYERS,
         )
     else:
-        compliance_axes, refusing_acts, compliant_acts = compute_pca_compliance_axis(
-            exp, refusing_prompts, wj_train, cap_layers,
+        compliance_axes, compliance_stats, refusing_acts, compliant_acts = compute_pca_compliance_axis(
+            exp, refusing_prompts, wj_train, CAP_LAYERS,
         )
 
     # Optional: orthogonalize compliance axes against benign direction
     if cfg.get("ORTHOGONALIZE", False):
         calibration = CALIBRATION_PROMPTS[:cfg["N_CALIBRATION"]]
-        compliance_axes = orthogonalize_compliance_axes(
-            exp, compliance_axes, calibration, cap_layers,
+        compliance_axes, compliance_stats = orthogonalize_compliance_axes(
+            exp, compliance_axes, calibration,
+            refusing_acts, compliant_acts, CAP_LAYERS,
         )
 
-    cos_val = (compliance_axes[cap_layers[-1]] @ assistant_axes[cap_layers[-1]]).item()
-    print(f"  cos(assistant, compliance) at L{cap_layers[-1]}: {cos_val:.4f}")
+    cos_val = (compliance_axes[CAP_LAYERS[-1]] @ assistant_axes[CAP_LAYERS[-1]]).item()
+    print(f"  cos(assistant, compliance) at L{CAP_LAYERS[-1]}: {cos_val:.4f}")
 
     # Step 4: Load the test prompts (jailbreak + benign)
     cross_only = cfg.get("CROSS_ONLY", False)
     prompts = build_prompts(cfg)
 
-    # Step 5: Compute compliance thresholds from the FINAL axes (after orthogonalization)
-    print("\nComputing compliance thresholds on final axes...")
-    compliance_stats = compute_compliance_thresholds(
-        exp, compliance_axes, refusing_prompts, wj_train, cap_layers
-    )
-    threshold_method = cfg.get("COMPLIANCE_THRESHOLD", "mean+std")
+    # Step 5: Compute compliance thresholds from refusing/compliant projection stats
+    threshold_method = cfg["COMPLIANCE_THRESHOLD"]
     compliance_taus = {
         li: _compliance_tau(compliance_stats[li], threshold_method)
-        for li in cap_layers
+        for li in CAP_LAYERS
     }
     print(f"\nCompliance thresholds ({threshold_method}):")
-    for li in [cap_layers[0], cap_layers[-1]]:
+    for li in [CAP_LAYERS[0], CAP_LAYERS[-1]]:
         s = compliance_stats[li]
         print(f"  L{li}: tau={compliance_taus[li]:.1f}  "
               f"refusing={s['mean_refusing']:.1f}+/-{s['std_refusing']:.1f}  "
@@ -974,7 +941,7 @@ def do_run(args, cfg, output_dir):
     # Step 6: Run the experiment (baseline + assistant-cap + cross-cap per prompt)
     print(f"\nRunning experiment on {len(prompts)} prompts...")
     df = run_experiment(
-        exp, prompts, cap_layers,
+        exp, prompts, CAP_LAYERS,
         assistant_axes, compliance_axes,
         assistant_taus, compliance_taus,
         cfg["MAX_NEW_TOKENS"],
