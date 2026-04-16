@@ -966,6 +966,103 @@ def compute_mean_diff_compliance_axis(
     return per_layer_axes, per_layer_stats
 
 
+def orthogonalize_compliance_axes(
+    exp: SteeringExperiment,
+    compliance_axes: dict[int, torch.Tensor],
+    benign_prompts: list[str],
+    refusing_prompts: list[str],
+    compliant_prompts: list[str],
+    cap_layers: list[int],
+) -> tuple[dict[int, torch.Tensor], dict[int, dict[str, float]]]:
+    """Remove the benign component from compliance axes.
+
+    Computes a "benign direction" at each cap layer (PC1 of benign
+    activations), then projects it out of the compliance axis. The
+    resulting vector can still push toward refusal but has zero
+    projection onto the direction that benign prompts naturally occupy.
+
+    Also recomputes threshold stats by projecting the refusing/compliant
+    activations onto the orthogonalized axes.
+
+    Returns:
+        orth_axes:       dict mapping layer_idx -> orthogonalized unit vector
+        orth_stats:      dict mapping layer_idx -> threshold stats
+    """
+    logger.info(
+        "Orthogonalizing compliance axes against benign direction "
+        "(%d benign, %d refusing, %d compliant, L%d-L%d)...",
+        len(benign_prompts), len(refusing_prompts), len(compliant_prompts),
+        cap_layers[0], cap_layers[-1],
+    )
+
+    # Collect activations at each cap layer for all three prompt sets
+    benign_acts = {li: [] for li in cap_layers}
+    refusing_acts = {li: [] for li in cap_layers}
+    compliant_acts = {li: [] for li in cap_layers}
+
+    for prompt in tqdm(benign_prompts, desc="  Benign activations", leave=False):
+        ids = exp.tokenize(prompt)
+        acts, _ = exp.get_baseline_trajectory(ids)
+        for li in cap_layers:
+            benign_acts[li].append(acts[li].float())
+
+    for prompt in tqdm(refusing_prompts, desc="  Refusing activations", leave=False):
+        ids = exp.tokenize(prompt)
+        acts, _ = exp.get_baseline_trajectory(ids)
+        for li in cap_layers:
+            refusing_acts[li].append(acts[li].float())
+
+    for prompt in tqdm(compliant_prompts, desc="  Compliant activations", leave=False):
+        ids = exp.tokenize(prompt)
+        acts, _ = exp.get_baseline_trajectory(ids)
+        for li in cap_layers:
+            compliant_acts[li].append(acts[li].float())
+
+    orth_axes = {}
+    orth_stats = {}
+    for li in cap_layers:
+        benign_stack = torch.stack(benign_acts[li])
+
+        # Compute benign direction via PCA (PC1)
+        centered = benign_stack - benign_stack.mean(dim=0)
+        _, S, Vt = torch.linalg.svd(centered, full_matrices=False)
+        benign_dir = Vt[0].float()
+        benign_dir = benign_dir / benign_dir.norm()
+
+        # Orthogonalize: remove benign component from compliance axis
+        comp = compliance_axes[li].float()
+        overlap = (comp @ benign_dir).item()
+        orth = comp - overlap * benign_dir
+        orth = orth / orth.norm()
+        orth_axes[li] = orth.cpu()
+
+        # Recompute threshold stats on the orthogonalized axis
+        refusing_stack = torch.stack(refusing_acts[li])
+        compliant_stack = torch.stack(compliant_acts[li])
+        refusing_projs = (refusing_stack @ orth).numpy()
+        compliant_projs = (compliant_stack @ orth).numpy()
+        mean_r = float(refusing_projs.mean())
+        mean_c = float(compliant_projs.mean())
+        std_r = float(refusing_projs.std())
+        std_c = float(compliant_projs.std())
+        orth_stats[li] = {
+            "mean_refusing":  mean_r,
+            "mean_compliant": mean_c,
+            "std_refusing":   std_r,
+            "std_compliant":  std_c,
+            "optimal":        (mean_r + mean_c) / 2.0,
+            "mean+std":       mean_c + std_c,
+            "separation":     mean_r - mean_c,
+        }
+
+        logger.info(
+            "  L%d: cos(comp,benign)=%.3f -> %.6f  sep=%.1f",
+            li, overlap, (orth @ benign_dir).item(), mean_r - mean_c,
+        )
+
+    return orth_axes, orth_stats
+
+
 # ---------------------------------------------------------------------------
 # Generation functions
 # ---------------------------------------------------------------------------

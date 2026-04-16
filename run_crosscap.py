@@ -86,6 +86,7 @@ from crosscap_experiment import (
     compute_discriminative_thresholds,      # finds per-layer firing thresholds
     compute_pca_compliance_axis,            # builds compliance axis via PCA
     compute_mean_diff_compliance_axis,      # builds compliance axis via mean difference
+    orthogonalize_compliance_axes,          # remove benign component from compliance axes
     generate_baseline,                      # uncapped generation (control)
     generate_capped,                        # single-axis capping
     generate_cross_capped,                  # cross-axis capping (the new method)
@@ -706,8 +707,15 @@ def do_warmup(args, cfg, output_dir):
             exp, refusing_prompts, wj_train, CAP_LAYERS,
         )
 
+    # Optional: orthogonalize compliance axes against benign direction
+    if cfg.get("ORTHOGONALIZE", False):
+        calibration = CALIBRATION_PROMPTS[:cfg["N_CALIBRATION"]]
+        compliance_axes, compliance_stats = orthogonalize_compliance_axes(
+            exp, compliance_axes, calibration,
+            refusing_prompts, wj_train, CAP_LAYERS,
+        )
+
     # How similar are the two axes? Low cosine = they point in different directions
-    # (which is the whole point -- if they were identical, cross-axis = single-axis)
     cos_val = (compliance_axes[CAP_LAYERS[-1]] @ assistant_axes[CAP_LAYERS[-1]]).item()
     print(f"  cos(assistant, compliance) at L{CAP_LAYERS[-1]}: {cos_val:.4f}")
 
@@ -902,6 +910,14 @@ def do_run(args, cfg, output_dir):
             exp, refusing_prompts, wj_train, CAP_LAYERS,
         )
 
+    # Optional: orthogonalize compliance axes against benign direction
+    if cfg.get("ORTHOGONALIZE", False):
+        calibration = CALIBRATION_PROMPTS[:cfg["N_CALIBRATION"]]
+        compliance_axes, compliance_stats = orthogonalize_compliance_axes(
+            exp, compliance_axes, calibration,
+            refusing_prompts, wj_train, CAP_LAYERS,
+        )
+
     cos_val = (compliance_axes[CAP_LAYERS[-1]] @ assistant_axes[CAP_LAYERS[-1]]).item()
     print(f"  cos(assistant, compliance) at L{CAP_LAYERS[-1]}: {cos_val:.4f}")
 
@@ -964,12 +980,14 @@ def main():
         start, end = map(int, args.cap_layers.split("-"))
         CAP_LAYERS = list(range(start, end))
 
-    # Store the compliance threshold method in cfg so do_warmup/do_run can use it
+    # Store options in cfg so do_warmup/do_run can use them
     cfg["COMPLIANCE_THRESHOLD"] = args.compliance_threshold
+    cfg["ORTHOGONALIZE"] = not args.no_orthogonalize
 
     print(f"Preset: {args.preset}")
     print(f"Model: {MODEL_NAME}")
     print(f"Compliance threshold: {args.compliance_threshold}")
+    print(f"Orthogonalize: {cfg['ORTHOGONALIZE']}")
     print(f"Cap layers: L{CAP_LAYERS[0]}-L{CAP_LAYERS[-1]} ({len(CAP_LAYERS)} layers)")
 
     # Dispatch to the right mode
@@ -1024,6 +1042,10 @@ def parse_args():
              "optimal = midpoint of benign/jailbreak means, "
              "mean = mean_jailbreak, "
              "p25 = 25th percentile of combined",
+    )
+    parser.add_argument(
+        "--no-orthogonalize", action="store_true",
+        help="Skip orthogonalizing compliance axes against benign direction",
     )
     return parser.parse_args()
 
