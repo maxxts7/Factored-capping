@@ -4,6 +4,8 @@ An exploratory study on separating jailbreak detection from correction in LLM ac
 
 This project was done as part of the BlueDot Technical AI Safety project sprint. Compute costs were covered by Rapid Grants.
 
+For a more conceptual write-up that explains the ideas from the ground up, see the companion article: [manutechblog.netlify.app](https://manutechblog.netlify.app/)
+
 I have tried to explain everything in detail throughout this document and the codebase. If you find any information missing or the structure hard to follow, please reach out to me at manuxtmail@gmail.com.
 
 ## What is this?
@@ -31,6 +33,7 @@ Cross-axis capping nearly doubles the refusal rate while halving compliance -- a
 ## Repository Structure
 
 ```
+primer.ipynb                 Hands-on tutorial covering every concept used in the experiment
 crosscap_experiment.py      Core library (model loading, capping hooks, axis math, generation)
 run_crosscap.py             Main script that orchestrates the experiment
 reclassify_refusals.py      Post-hoc LLM judge (sends outputs to Claude Sonnet for labeling)
@@ -194,7 +197,7 @@ python analyze_csvs.py
 
 | Preset | Jailbreak prompts | Benign prompts | Max tokens | When to use |
 |---|---|---|---|---|
-| `sanity` | 5 | 10 | 64 | Smoke test -- does it run at all? |
+| `sanity` | 10 | 10 | 256 | Smoke test -- does it run at all? |
 | `small` | 20 | 20 | 128 | Development and debugging |
 | `full` | 100 | 50 | 256 | The real experiment |
 | `full_meandiff` | 100 | 50 | 256 | Variant using mean-difference axis instead of PCA |

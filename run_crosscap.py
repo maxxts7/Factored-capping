@@ -121,14 +121,14 @@ logger = logging.getLogger("crosscap")
 # ============================================================
 
 PRESETS = {
-    # Quick smoke test: 10 prompts, tiny output -- verifies the code runs
+    # Quick smoke test: 10 prompts, full-length output -- verifies the code runs
     # with reliable axis/thresholds (50 calibration + 50 compliance)
     "sanity": {
         "N_PROMPTS": 10,
         "N_CALIBRATION": 50,
         "N_COMPLIANCE": 50,
         "N_BENIGN_EVAL": 10,
-        "MAX_NEW_TOKENS": 64,
+        "MAX_NEW_TOKENS": 256,
         "OUTPUT_DIR": "results/crosscap_sanity",
     },
     # Development preset: enough prompts to see patterns, fast enough to iterate
