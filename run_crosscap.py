@@ -1100,14 +1100,15 @@ def parse_args():
     )
     parser.add_argument(
         "--cross-detect-method", type=str, default="benign-p5",
-        choices=["benign-p5", "benign-p10", "midpoint"],
+        choices=["benign-p1", "benign-p5", "benign-p10", "midpoint"],
         help="How to place the cross-cap DETECTION threshold on the assistant "
              "axis, recomputed from your benign + jailbreak calibration prompts. "
-             "benign-p5 = 5th percentile of benign projections (<=5%% benign FP "
-             "rate by construction; default). benign-p10 = 10th percentile "
-             "(looser). midpoint = (mean_benign + mean_jailbreak) / 2 "
-             "(symmetric discriminative boundary). The paper's assistant_taus "
-             "are kept untouched for Mode 2 (assistant-cap) either way.",
+             "benign-p1 = 1st percentile (<=1%% benign FP; most selective). "
+             "benign-p5 = 5th percentile (<=5%% benign FP; default). "
+             "benign-p10 = 10th percentile (<=10%% benign FP; most permissive). "
+             "midpoint = (mean_benign + mean_jailbreak) / 2 (symmetric "
+             "discriminative boundary). The paper's assistant_taus are kept "
+             "untouched for Mode 2 (assistant-cap) either way.",
     )
     parser.add_argument(
         "--n-detect-cal", type=int, default=None,

@@ -710,10 +710,12 @@ def compute_cross_detect_thresholds(
     often (less aggressive), which is the point of tuning this cutoff.
 
     Methods (all data-driven on YOUR prompts):
+      - "benign-p1":  tau = 1st percentile of benign projections
+                      (<=1% benign FP; most selective gate)
       - "benign-p5":  tau = 5th percentile of benign projections
-                      (by construction <= 5% of benign prompts trip
-                      detection, regardless of where jailbreaks land)
-      - "benign-p10": 10th percentile of benign projections (looser)
+                      (<=5% benign FP by construction; default)
+      - "benign-p10": 10th percentile of benign projections
+                      (<=10% benign FP; most permissive gate)
       - "midpoint":   tau = (mean_benign + mean_jailbreak) / 2
                       (symmetric discriminative boundary)
 
@@ -722,7 +724,7 @@ def compute_cross_detect_thresholds(
         stats: {layer_idx -> {
             "mean_benign", "std_benign",
             "mean_jailbreak", "std_jailbreak",
-            "p5_benign", "p10_benign", "midpoint", "separation",
+            "p1_benign", "p5_benign", "p10_benign", "midpoint", "separation",
         }}
     """
     logger.info(
@@ -752,6 +754,7 @@ def compute_cross_detect_thresholds(
         b = np.asarray(benign_projs[li], dtype=np.float32)
         j = np.asarray(jb_projs[li],     dtype=np.float32)
         mean_b, mean_j = float(b.mean()), float(j.mean())
+        p1_b  = float(np.percentile(b,  1))
         p5_b  = float(np.percentile(b,  5))
         p10_b = float(np.percentile(b, 10))
         midpoint = (mean_b + mean_j) / 2.0
@@ -760,12 +763,15 @@ def compute_cross_detect_thresholds(
             "std_benign":     float(b.std()),
             "mean_jailbreak": mean_j,
             "std_jailbreak":  float(j.std()),
+            "p1_benign":      p1_b,
             "p5_benign":      p5_b,
             "p10_benign":     p10_b,
             "midpoint":       midpoint,
             "separation":     mean_b - mean_j,
         }
-        if method == "benign-p5":
+        if method == "benign-p1":
+            taus[li] = p1_b
+        elif method == "benign-p5":
             taus[li] = p5_b
         elif method == "benign-p10":
             taus[li] = p10_b
@@ -774,7 +780,7 @@ def compute_cross_detect_thresholds(
         else:
             raise ValueError(
                 f"Unknown cross-detect method: {method!r} "
-                "(expected benign-p5, benign-p10, or midpoint)"
+                "(expected benign-p1, benign-p5, benign-p10, or midpoint)"
             )
 
     for li in [cap_layers[0], cap_layers[-1]]:
