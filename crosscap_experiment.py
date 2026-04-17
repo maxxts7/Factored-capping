@@ -785,6 +785,109 @@ def compute_discriminative_thresholds(
     return thresholds
 
 
+def compute_cross_detect_thresholds(
+    exp: "SteeringExperiment",
+    benign_prompts: list[str],
+    jailbreak_prompts: list[str],
+    assistant_axes: dict[int, torch.Tensor],
+    cap_layers: list[int],
+    method: str = "benign-p5",
+) -> tuple[dict[int, float], dict[int, dict[str, float]]]:
+    """Per-layer detection thresholds for the cross-cap gate, computed from
+    your own benign + jailbreak calibration prompts projected onto the
+    (paper's) assistant axis.
+
+    The assistant axis vector is unchanged -- only the scalar cutoff used by
+    the cross-cap detection gate is recomputed, so the gate fires on prompts
+    that look jailbreak-like on YOUR eval distribution rather than on the
+    paper's calibration distribution. The paper's assistant_taus are kept
+    untouched for Mode 2 (single-axis assistant-cap), so the baseline
+    comparison stays fair.
+
+    Detection fires when (h_last @ v_assist) < tau. Lower tau = fires less
+    often (less aggressive), which is the point of tuning this cutoff.
+
+    Methods (all data-driven on YOUR prompts):
+      - "benign-p5":  tau = 5th percentile of benign projections
+                      (by construction <= 5% of benign prompts trip
+                      detection, regardless of where jailbreaks land)
+      - "benign-p10": 10th percentile of benign projections (looser)
+      - "midpoint":   tau = (mean_benign + mean_jailbreak) / 2
+                      (symmetric discriminative boundary)
+
+    Returns:
+        taus:  {layer_idx -> tau (float)}
+        stats: {layer_idx -> {
+            "mean_benign", "std_benign",
+            "mean_jailbreak", "std_jailbreak",
+            "p5_benign", "p10_benign", "midpoint", "separation",
+        }}
+    """
+    logger.info(
+        "Computing cross-cap detection thresholds on assistant axis at "
+        "L%d-L%d (%d benign, %d jailbreak, method=%s)...",
+        cap_layers[0], cap_layers[-1],
+        len(benign_prompts), len(jailbreak_prompts), method,
+    )
+
+    def last_token_projs(prompts: list[str], label: str) -> dict[int, list[float]]:
+        projs = {li: [] for li in cap_layers}
+        for prompt in tqdm(prompts, desc=f"  detect-cal {label}", leave=False):
+            ids = exp.tokenize(prompt)
+            hs, _ = exp.get_baseline_trajectory(ids)
+            for li in cap_layers:
+                h_last = hs[li].float()
+                v = assistant_axes[li].float().to(h_last.device)
+                projs[li].append((h_last @ v).item())
+        return projs
+
+    benign_projs = last_token_projs(benign_prompts, "benign")
+    jb_projs     = last_token_projs(jailbreak_prompts, "jailbreak")
+
+    taus: dict[int, float] = {}
+    stats: dict[int, dict[str, float]] = {}
+    for li in cap_layers:
+        b = np.asarray(benign_projs[li], dtype=np.float32)
+        j = np.asarray(jb_projs[li],     dtype=np.float32)
+        mean_b, mean_j = float(b.mean()), float(j.mean())
+        p5_b  = float(np.percentile(b,  5))
+        p10_b = float(np.percentile(b, 10))
+        midpoint = (mean_b + mean_j) / 2.0
+        stats[li] = {
+            "mean_benign":    mean_b,
+            "std_benign":     float(b.std()),
+            "mean_jailbreak": mean_j,
+            "std_jailbreak":  float(j.std()),
+            "p5_benign":      p5_b,
+            "p10_benign":     p10_b,
+            "midpoint":       midpoint,
+            "separation":     mean_b - mean_j,
+        }
+        if method == "benign-p5":
+            taus[li] = p5_b
+        elif method == "benign-p10":
+            taus[li] = p10_b
+        elif method == "midpoint":
+            taus[li] = midpoint
+        else:
+            raise ValueError(
+                f"Unknown cross-detect method: {method!r} "
+                "(expected benign-p5, benign-p10, or midpoint)"
+            )
+
+    for li in [cap_layers[0], cap_layers[-1]]:
+        s = stats[li]
+        logger.info(
+            "  detect-tau L%d: tau=%.2f  benign=%.2f+/-%.2f  jailbreak=%.2f+/-%.2f  sep=%.2f",
+            li, taus[li],
+            s["mean_benign"], s["std_benign"],
+            s["mean_jailbreak"], s["std_jailbreak"],
+            s["separation"],
+        )
+
+    return taus, stats
+
+
 # ---------------------------------------------------------------------------
 # Compliance axis construction
 # ---------------------------------------------------------------------------

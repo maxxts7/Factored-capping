@@ -49,7 +49,10 @@ Multi-GPU (recommended for the full 100-prompt run):
      Load model + assistant axis from HuggingFace
      Download JBB-Behaviors (refusing prompts) + WildJailbreak (compliant prompts)
      Build the compliance axis (PCA or mean-diff)
-     Compute per-layer thresholds (midpoint of benign vs jailbreak projections)
+     Compute per-layer COMPLIANCE thresholds from refusing/compliant projections
+     Compute per-layer CROSS-CAP DETECTION thresholds on the assistant axis
+       from your own benign (CALIBRATION_PROMPTS) + jailbreak (held-out WJ-train)
+       calibration prompts -- paper's assistant_taus kept untouched for Mode 2
      Save everything to warmup.pt
 
   2. GENERATION (per prompt)
@@ -84,6 +87,7 @@ from crosscap_experiment import (
     SteeringExperiment,                     # loads model + axis
     load_original_capping,                  # loads the original paper's exact axes + thresholds
     compute_discriminative_thresholds,      # finds per-layer firing thresholds
+    compute_cross_detect_thresholds,        # recomputes cross-cap detection tau on YOUR data
     compute_pca_compliance_axis,            # builds compliance axis via PCA
     compute_mean_diff_compliance_axis,      # builds compliance axis via mean difference
     orthogonalize_compliance_axes,          # remove benign component from compliance axes
@@ -126,6 +130,7 @@ PRESETS = {
         "N_PROMPTS": 10,
         "N_CALIBRATION": 50,
         "N_COMPLIANCE": 50,
+        "N_DETECT_CAL": 50,       # benign CALIBRATION_PROMPTS + held-out WJ-train
         "N_BENIGN_EVAL": 10,
         "MAX_NEW_TOKENS": 64,
         "OUTPUT_DIR": "results/crosscap_sanity",
@@ -135,6 +140,7 @@ PRESETS = {
         "N_PROMPTS": 20,
         "N_CALIBRATION": 20,
         "N_COMPLIANCE": 20,
+        "N_DETECT_CAL": 50,
         "N_BENIGN_EVAL": 50,
         "MAX_NEW_TOKENS": 128,
         "OUTPUT_DIR": "results/crosscap_small",
@@ -144,6 +150,7 @@ PRESETS = {
         "N_PROMPTS": 250,
         "N_CALIBRATION": 50,
         "N_COMPLIANCE": 50,
+        "N_DETECT_CAL": 50,
         "N_BENIGN_EVAL": 100,
         "MAX_NEW_TOKENS": 256,
         "OUTPUT_DIR": "results/crosscap_full",
@@ -154,6 +161,7 @@ PRESETS = {
         "N_PROMPTS": 250,
         "N_CALIBRATION": 50,
         "N_COMPLIANCE": 50,
+        "N_DETECT_CAL": 50,
         "N_BENIGN_EVAL": 100,
         "MAX_NEW_TOKENS": 256,
         "OUTPUT_DIR": "results/crosscap_full_meandiff",
@@ -420,8 +428,9 @@ def run_experiment(
     cap_layers: list[int],               # which layers to cap at (e.g. L46-L53)
     assistant_axes: dict[int, torch.Tensor],  # per-layer assistant axis vectors
     compliance_axes: dict[int, torch.Tensor], # per-layer compliance axis vectors
-    assistant_taus: dict[int, float],    # per-layer thresholds for the assistant axis
+    assistant_taus: dict[int, float],    # paper's tau -- used by Mode 2 (assistant-cap)
     compliance_taus: dict[int, float],   # per-layer thresholds for the compliance axis
+    cross_detect_taus: dict[int, float], # data-driven tau -- used by Mode 3 detect gate
     max_new_tokens: int,                 # max tokens to generate per prompt
     cross_only: bool = False,            # if True, skip assistant-axis capping
 ) -> pd.DataFrame:
@@ -488,7 +497,7 @@ def run_experiment(
                 exp, input_ids, cap_layers,
                 per_layer_detect_axes=assistant_axes,  # "is this a jailbreak?" (gate)
                 correct_axes=compliance_axes,          # "push toward refusal" (correction)
-                detect_thresholds=assistant_taus,
+                detect_thresholds=cross_detect_taus,   # data-driven, NOT the paper's
                 correct_thresholds=compliance_taus,
                 track_layers=track_layers,
                 per_layer_track_axes=assistant_axes,
@@ -618,8 +627,11 @@ def save_results(df, output_dir, args, cos_val, cfg, elapsed, cross_only=False):
         "max_new_tokens": cfg["MAX_NEW_TOKENS"],
         "timestamp": datetime.now().isoformat(),
         "cos_similarity": cos_val,                             # how similar the two axes are
-        "assistant_threshold_method": "optimal (discriminative midpoint)",
+        "assistant_threshold_method": "paper (load_original_capping) -- used by Mode 2",
         "compliance_threshold_method": cfg.get("COMPLIANCE_THRESHOLD", "mean+std"),
+        "cross_detect_method": cfg.get("CROSS_DETECT_METHOD", "benign-p5"),
+        "n_detect_cal": cfg.get("N_DETECT_CAL"),
+        "orthogonalize": cfg.get("ORTHOGONALIZE", False),
         "axis_method": cfg.get("AXIS_METHOD", "pca"),
         "cross_only": cross_only,
     }
@@ -693,10 +705,19 @@ def do_warmup(args, cfg, output_dir):
     # Step 3: Build the compliance axis
     # This downloads JBB-Behaviors (refusing) and WildJailbreak train (compliant),
     # runs both through the model, and computes the axis via PCA or mean-diff.
+    #
+    # We load WJ train with n_compliance + n_detect_cal prompts so that the first
+    # n_compliance slice is used for compliance axis construction and the NEXT
+    # n_detect_cal slice becomes held-out calibration for the cross-cap detection
+    # tau. Both slices are disjoint from the WildJailbreak EVAL split used for
+    # the actual experiment, so eval prompts never leak into calibration.
     n_compliance = cfg["N_COMPLIANCE"]
+    n_detect_cal = cfg["N_DETECT_CAL"]
     print(f"\nBuilding compliance axis ({n_compliance} prompts per side)...")
     refusing_prompts = load_jbb_behaviors(n_prompts=n_compliance)    # model refuses these
-    wj_train = load_wildjailbreak_train(n_prompts=n_compliance)      # model complies with these
+    wj_train_full = load_wildjailbreak_train(n_prompts=n_compliance + n_detect_cal)
+    wj_train = wj_train_full[:n_compliance]                          # compliance axis slice
+    wj_detect_cal = wj_train_full[n_compliance:n_compliance + n_detect_cal]  # detect-tau slice
 
     if cfg.get("AXIS_METHOD") == "mean_diff":
         compliance_axes, compliance_stats, refusing_acts, compliant_acts = compute_mean_diff_compliance_axis(
@@ -707,7 +728,10 @@ def do_warmup(args, cfg, output_dir):
             exp, refusing_prompts, wj_train, CAP_LAYERS,
         )
 
-    # Optional: orthogonalize compliance axes against benign direction
+    # Optional: orthogonalize compliance axes against benign direction.
+    # Off by default now that CALIBRATION_PROMPTS is reserved for detect-tau
+    # calibration -- using it here too would correlate axis geometry with the
+    # threshold we compute from the same prompts.
     if cfg.get("ORTHOGONALIZE", False):
         calibration = CALIBRATION_PROMPTS[:cfg["N_CALIBRATION"]]
         compliance_axes, compliance_stats = orthogonalize_compliance_axes(
@@ -738,14 +762,39 @@ def do_warmup(args, cfg, output_dir):
               f"refusing={s['mean_refusing']:.1f}+/-{s['std_refusing']:.1f}  "
               f"compliant={s['mean_compliant']:.1f}+/-{s['std_compliant']:.1f}")
 
+    # Step 5b: Compute CROSS-CAP detection tau on YOUR data.
+    # The paper's assistant_taus stay untouched (Mode 2 uses them). This new
+    # tau is only used for the cross-cap detection gate in Mode 3.
+    cross_detect_method = cfg["CROSS_DETECT_METHOD"]
+    benign_detect_cal = CALIBRATION_PROMPTS[:n_detect_cal]
+    print(
+        f"\nCross-cap detection tau calibration "
+        f"(method={cross_detect_method}, "
+        f"benign={len(benign_detect_cal)} calibration prompts, "
+        f"jailbreak={len(wj_detect_cal)} held-out WJ-train)"
+    )
+    cross_detect_taus, cross_detect_stats = compute_cross_detect_thresholds(
+        exp, benign_detect_cal, wj_detect_cal,
+        assistant_axes, CAP_LAYERS,
+        method=cross_detect_method,
+    )
+    print("Cross-cap detection thresholds (paper tau -> new tau):")
+    for li in [CAP_LAYERS[0], CAP_LAYERS[-1]]:
+        s = cross_detect_stats[li]
+        print(f"  L{li}: paper={assistant_taus[li]:.2f}  new={cross_detect_taus[li]:.2f}  "
+              f"benign={s['mean_benign']:.2f}+/-{s['std_benign']:.2f}  "
+              f"jailbreak={s['mean_jailbreak']:.2f}+/-{s['std_jailbreak']:.2f}")
+
     # Step 6: Save everything to disk so chunk workers can load it without
     # re-doing all this computation
     warmup_path = output_dir / WARMUP_FILE
     torch.save({
         "assistant_axes": assistant_axes,
         "compliance_axes": compliance_axes,
-        "assistant_taus": assistant_taus,
+        "assistant_taus": assistant_taus,            # paper's, used by Mode 2
         "compliance_taus": compliance_taus,
+        "cross_detect_taus": cross_detect_taus,      # data-driven, used by Mode 3 detect gate
+        "cross_detect_stats": cross_detect_stats,
         "cos_similarity": cos_val,
     }, warmup_path)
 
@@ -788,8 +837,14 @@ def do_chunk(args, cfg, output_dir):
     state = torch.load(warmup_path, map_location="cpu", weights_only=False)
     assistant_axes = state["assistant_axes"]
     compliance_axes = state["compliance_axes"]
-    assistant_taus = state["assistant_taus"]
+    assistant_taus = state["assistant_taus"]              # paper's, Mode 2
     compliance_taus = state["compliance_taus"]
+    if "cross_detect_taus" not in state:
+        raise KeyError(
+            f"{warmup_path} is missing 'cross_detect_taus'. "
+            "Re-run --warmup with this version of the code."
+        )
+    cross_detect_taus = state["cross_detect_taus"]        # data-driven, Mode 3 detect gate
 
     # Step 2: Load the model (each chunk worker needs its own copy in GPU memory)
     print(f"Loading model: {MODEL_NAME}")
@@ -809,7 +864,7 @@ def do_chunk(args, cfg, output_dir):
     df = run_experiment(
         exp, chunk_prompts, CAP_LAYERS,
         assistant_axes, compliance_axes,
-        assistant_taus, compliance_taus,
+        assistant_taus, compliance_taus, cross_detect_taus,
         cfg["MAX_NEW_TOKENS"],
         cross_only=cross_only,
     )
@@ -895,11 +950,16 @@ def do_run(args, cfg, output_dir):
         ax = exp.axis[final_layer].float()
         assistant_axes[final_layer] = ax / ax.norm()
 
-    # Step 3: Build the compliance axis from refusing + compliant activations
+    # Step 3: Build the compliance axis from refusing + compliant activations.
+    # WJ train is loaded with n_compliance + n_detect_cal prompts: first slice
+    # builds the compliance axis, next slice is held out for detect-tau calibration.
     n_compliance = cfg["N_COMPLIANCE"]
+    n_detect_cal = cfg["N_DETECT_CAL"]
     print(f"\nBuilding compliance axis ({n_compliance} prompts per side)...")
     refusing_prompts = load_jbb_behaviors(n_prompts=n_compliance)
-    wj_train = load_wildjailbreak_train(n_prompts=n_compliance)
+    wj_train_full = load_wildjailbreak_train(n_prompts=n_compliance + n_detect_cal)
+    wj_train = wj_train_full[:n_compliance]
+    wj_detect_cal = wj_train_full[n_compliance:n_compliance + n_detect_cal]
 
     if cfg.get("AXIS_METHOD") == "mean_diff":
         compliance_axes, compliance_stats, refusing_acts, compliant_acts = compute_mean_diff_compliance_axis(
@@ -910,7 +970,8 @@ def do_run(args, cfg, output_dir):
             exp, refusing_prompts, wj_train, CAP_LAYERS,
         )
 
-    # Optional: orthogonalize compliance axes against benign direction
+    # Optional: orthogonalize compliance axes against benign direction.
+    # Off by default (see do_warmup comment for rationale).
     if cfg.get("ORTHOGONALIZE", False):
         calibration = CALIBRATION_PROMPTS[:cfg["N_CALIBRATION"]]
         compliance_axes, compliance_stats = orthogonalize_compliance_axes(
@@ -938,12 +999,34 @@ def do_run(args, cfg, output_dir):
               f"refusing={s['mean_refusing']:.1f}+/-{s['std_refusing']:.1f}  "
               f"compliant={s['mean_compliant']:.1f}+/-{s['std_compliant']:.1f}")
 
+    # Step 5b: Compute CROSS-CAP detection tau on YOUR data (assistant axis vector
+    # unchanged; paper's assistant_taus stay in use for Mode 2).
+    cross_detect_method = cfg["CROSS_DETECT_METHOD"]
+    benign_detect_cal = CALIBRATION_PROMPTS[:n_detect_cal]
+    print(
+        f"\nCross-cap detection tau calibration "
+        f"(method={cross_detect_method}, "
+        f"benign={len(benign_detect_cal)} calibration prompts, "
+        f"jailbreak={len(wj_detect_cal)} held-out WJ-train)"
+    )
+    cross_detect_taus, cross_detect_stats = compute_cross_detect_thresholds(
+        exp, benign_detect_cal, wj_detect_cal,
+        assistant_axes, CAP_LAYERS,
+        method=cross_detect_method,
+    )
+    print("Cross-cap detection thresholds (paper tau -> new tau):")
+    for li in [CAP_LAYERS[0], CAP_LAYERS[-1]]:
+        s = cross_detect_stats[li]
+        print(f"  L{li}: paper={assistant_taus[li]:.2f}  new={cross_detect_taus[li]:.2f}  "
+              f"benign={s['mean_benign']:.2f}+/-{s['std_benign']:.2f}  "
+              f"jailbreak={s['mean_jailbreak']:.2f}+/-{s['std_jailbreak']:.2f}")
+
     # Step 6: Run the experiment (baseline + assistant-cap + cross-cap per prompt)
     print(f"\nRunning experiment on {len(prompts)} prompts...")
     df = run_experiment(
         exp, prompts, CAP_LAYERS,
         assistant_axes, compliance_axes,
-        assistant_taus, compliance_taus,
+        assistant_taus, compliance_taus, cross_detect_taus,
         cfg["MAX_NEW_TOKENS"],
         cross_only=cross_only,
     )
@@ -982,11 +1065,26 @@ def main():
 
     # Store options in cfg so do_warmup/do_run can use them
     cfg["COMPLIANCE_THRESHOLD"] = args.compliance_threshold
-    cfg["ORTHOGONALIZE"] = not args.no_orthogonalize
+    cfg["CROSS_DETECT_METHOD"] = args.cross_detect_method
+    cfg["ORTHOGONALIZE"] = args.orthogonalize          # off by default now
+    if args.n_detect_cal is not None:
+        cfg["N_DETECT_CAL"] = args.n_detect_cal
+
+    # CALIBRATION_PROMPTS is the benign source for detect-tau. Cap n_detect_cal
+    # at what's actually available so we don't silently pad.
+    if cfg["N_DETECT_CAL"] > len(CALIBRATION_PROMPTS):
+        print(
+            f"  (note: N_DETECT_CAL={cfg['N_DETECT_CAL']} exceeds "
+            f"len(CALIBRATION_PROMPTS)={len(CALIBRATION_PROMPTS)}; "
+            f"clamping to {len(CALIBRATION_PROMPTS)})"
+        )
+        cfg["N_DETECT_CAL"] = len(CALIBRATION_PROMPTS)
 
     print(f"Preset: {args.preset}")
     print(f"Model: {MODEL_NAME}")
     print(f"Compliance threshold: {args.compliance_threshold}")
+    print(f"Cross-cap detect method: {args.cross_detect_method}  "
+          f"(n_detect_cal={cfg['N_DETECT_CAL']})")
     print(f"Orthogonalize: {cfg['ORTHOGONALIZE']}")
     print(f"Cap layers: L{CAP_LAYERS[0]}-L{CAP_LAYERS[-1]} ({len(CAP_LAYERS)} layers)")
 
@@ -1044,8 +1142,29 @@ def parse_args():
              "p25 = 25th percentile of combined",
     )
     parser.add_argument(
-        "--no-orthogonalize", action="store_true",
-        help="Skip orthogonalizing compliance axes against benign direction",
+        "--orthogonalize", action="store_true",
+        help="Orthogonalize compliance axes against benign direction using "
+             "CALIBRATION_PROMPTS. Off by default because CALIBRATION_PROMPTS "
+             "is now reserved for cross-detect-tau calibration; enabling this "
+             "correlates axis geometry with the threshold computed from the "
+             "same prompts.",
+    )
+    parser.add_argument(
+        "--cross-detect-method", type=str, default="benign-p5",
+        choices=["benign-p5", "benign-p10", "midpoint"],
+        help="How to place the cross-cap DETECTION threshold on the assistant "
+             "axis, recomputed from your benign + jailbreak calibration prompts. "
+             "benign-p5 = 5th percentile of benign projections (<=5%% benign FP "
+             "rate by construction; default). benign-p10 = 10th percentile "
+             "(looser). midpoint = (mean_benign + mean_jailbreak) / 2 "
+             "(symmetric discriminative boundary). The paper's assistant_taus "
+             "are kept untouched for Mode 2 (assistant-cap) either way.",
+    )
+    parser.add_argument(
+        "--n-detect-cal", type=int, default=None,
+        help="Override N_DETECT_CAL from the preset. Number of benign "
+             "CALIBRATION_PROMPTS and held-out WJ-train prompts used for "
+             "cross-detect-tau calibration. Clamped to len(CALIBRATION_PROMPTS).",
     )
     return parser.parse_args()
 
