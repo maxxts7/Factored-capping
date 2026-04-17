@@ -803,6 +803,51 @@ def compute_cross_detect_thresholds(
 # without assuming the two clusters have equal spread.
 # ---------------------------------------------------------------------------
 
+def _collect_layer_activations(
+    exp: "SteeringExperiment",
+    prompts: list[str],
+    cap_layers: list[int],
+    desc: str,
+) -> dict[int, list[torch.Tensor]]:
+    """Run each prompt through the model and collect the last-token hidden
+    state at every cap layer."""
+    acts = {li: [] for li in cap_layers}
+    for prompt in tqdm(prompts, desc=desc, leave=False):
+        ids = exp.tokenize(prompt)
+        layer_acts, _ = exp.get_baseline_trajectory(ids)
+        for li in cap_layers:
+            acts[li].append(layer_acts[li].float())
+    return acts
+
+
+def _projection_stats(
+    refusing_stack: torch.Tensor,
+    compliant_stack: torch.Tensor,
+    axis: torch.Tensor,
+) -> dict[str, float]:
+    """Project the two activation stacks onto an axis and compute the summary
+    stats used for threshold selection and logging. Shared between PCA,
+    mean-diff, and orthogonalized axis paths so their stats dicts stay in
+    lockstep."""
+    refusing_projs = (refusing_stack @ axis).numpy()
+    compliant_projs = (compliant_stack @ axis).numpy()
+    mean_r = float(refusing_projs.mean())
+    mean_c = float(compliant_projs.mean())
+    std_r = float(refusing_projs.std())
+    std_c = float(compliant_projs.std())
+    p25 = float(np.percentile(np.concatenate([refusing_projs, compliant_projs]), 25))
+    return {
+        "mean_refusing":  mean_r,
+        "mean_compliant": mean_c,
+        "std_refusing":   std_r,
+        "std_compliant":  std_c,
+        "optimal":        (mean_r + mean_c) / 2.0,
+        "mean+std":       mean_c + std_c,
+        "p25":            p25,
+        "separation":     mean_r - mean_c,
+    }
+
+
 def compute_pca_compliance_axis(
     exp: SteeringExperiment,
     refusing_prompts: list[str],       # prompts the model refuses (e.g. bare harmful goals)
@@ -831,27 +876,13 @@ def compute_pca_compliance_axis(
         len(refusing_prompts), len(compliant_prompts),
     )
 
-    # --- Collect activations at ALL cap layers in one pass ---
-    refusing_acts = {li: [] for li in cap_layers}
-    compliant_acts = {li: [] for li in cap_layers}
+    refusing_acts = _collect_layer_activations(exp, refusing_prompts, cap_layers, f"  {axis_name} refusing")
+    compliant_acts = _collect_layer_activations(exp, compliant_prompts, cap_layers, f"  {axis_name} compliant")
 
-    for prompt in tqdm(refusing_prompts, desc=f"  {axis_name} refusing", leave=False):
-        ids = exp.tokenize(prompt)
-        acts, _ = exp.get_baseline_trajectory(ids)
-        for li in cap_layers:
-            refusing_acts[li].append(acts[li].float())
-
-    for prompt in tqdm(compliant_prompts, desc=f"  {axis_name} compliant", leave=False):
-        ids = exp.tokenize(prompt)
-        acts, _ = exp.get_baseline_trajectory(ids)
-        for li in cap_layers:
-            compliant_acts[li].append(acts[li].float())
-
-    # --- Run PCA at each cap layer separately ---
     per_layer_axes = {}
     per_layer_stats = {}
     for li in cap_layers:
-        refusing_stack  = torch.stack(refusing_acts[li])
+        refusing_stack = torch.stack(refusing_acts[li])
         compliant_stack = torch.stack(compliant_acts[li])
         pooled = torch.cat([refusing_stack, compliant_stack], dim=0)
 
@@ -866,37 +897,21 @@ def compute_pca_compliance_axis(
 
         pc1 = pc1 / pc1.norm()
         _assert_unit_norm(pc1, f"PCA compliance axis L{li}")
-        # Sign invariant: refusing should project higher than compliant.
         assert (pc1 @ mean_diff).item() >= 0, (
             f"PCA compliance axis L{li}: sign flip -- refusing projects below compliant"
         )
         var_explained = (S[0] ** 2 / (S ** 2).sum()).item() * 100
         per_layer_axes[li] = pc1.cpu()
 
-        # --- Compute threshold stats from refusing/compliant projections ---
-        # On this axis: high = refusing (safe), low = compliant (unsafe)
-        refusing_projs = (refusing_stack @ pc1).numpy()
-        compliant_projs = (compliant_stack @ pc1).numpy()
-        mean_r = float(refusing_projs.mean())
-        mean_c = float(compliant_projs.mean())
-        std_r = float(refusing_projs.std())
-        std_c = float(compliant_projs.std())
-        p25 = float(np.percentile(np.concatenate([refusing_projs, compliant_projs]), 25))
-        per_layer_stats[li] = {
-            "mean_refusing":  mean_r,
-            "mean_compliant": mean_c,
-            "std_refusing":   std_r,
-            "std_compliant":  std_c,
-            "optimal":        (mean_r + mean_c) / 2.0,
-            "mean+std":       mean_c + std_c,
-            "p25":            p25,
-            "separation":     mean_r - mean_c,
-            "var_explained":  var_explained,
-        }
+        stats = _projection_stats(refusing_stack, compliant_stack, pc1)
+        stats["var_explained"] = var_explained
+        per_layer_stats[li] = stats
         logger.info(
             "  %s L%d: var=%.1f%%  refusing=%.1f+/-%.1f  compliant=%.1f+/-%.1f  sep=%.1f",
-            axis_name, li, var_explained, mean_r, std_r, mean_c, std_c,
-            mean_r - mean_c,
+            axis_name, li, var_explained,
+            stats["mean_refusing"], stats["std_refusing"],
+            stats["mean_compliant"], stats["std_compliant"],
+            stats["separation"],
         )
 
     return per_layer_axes, per_layer_stats, refusing_acts, compliant_acts
@@ -925,20 +940,8 @@ def compute_mean_diff_compliance_axis(
         len(refusing_prompts), len(compliant_prompts),
     )
 
-    refusing_acts = {li: [] for li in cap_layers}
-    compliant_acts = {li: [] for li in cap_layers}
-
-    for prompt in tqdm(refusing_prompts, desc=f"  {axis_name} refusing", leave=False):
-        ids = exp.tokenize(prompt)
-        acts, _ = exp.get_baseline_trajectory(ids)
-        for li in cap_layers:
-            refusing_acts[li].append(acts[li].float())
-
-    for prompt in tqdm(compliant_prompts, desc=f"  {axis_name} compliant", leave=False):
-        ids = exp.tokenize(prompt)
-        acts, _ = exp.get_baseline_trajectory(ids)
-        for li in cap_layers:
-            compliant_acts[li].append(acts[li].float())
+    refusing_acts = _collect_layer_activations(exp, refusing_prompts, cap_layers, f"  {axis_name} refusing")
+    compliant_acts = _collect_layer_activations(exp, compliant_prompts, cap_layers, f"  {axis_name} compliant")
 
     per_layer_axes = {}
     per_layer_stats = {}
@@ -950,27 +953,14 @@ def compute_mean_diff_compliance_axis(
         _assert_unit_norm(md, f"mean-diff compliance axis L{li}")
         per_layer_axes[li] = md.cpu()
 
-        # Threshold stats from projections onto this axis
-        refusing_projs = (refusing_stack @ md).numpy()
-        compliant_projs = (compliant_stack @ md).numpy()
-        mean_r = float(refusing_projs.mean())
-        mean_c = float(compliant_projs.mean())
-        std_r = float(refusing_projs.std())
-        std_c = float(compliant_projs.std())
-        p25 = float(np.percentile(np.concatenate([refusing_projs, compliant_projs]), 25))
-        per_layer_stats[li] = {
-            "mean_refusing":  mean_r,
-            "mean_compliant": mean_c,
-            "std_refusing":   std_r,
-            "std_compliant":  std_c,
-            "optimal":        (mean_r + mean_c) / 2.0,
-            "mean+std":       mean_c + std_c,
-            "p25":            p25,
-            "separation":     mean_r - mean_c,
-        }
+        stats = _projection_stats(refusing_stack, compliant_stack, md)
+        per_layer_stats[li] = stats
         logger.info(
             "  %s L%d: refusing=%.1f+/-%.1f  compliant=%.1f+/-%.1f  sep=%.1f",
-            axis_name, li, mean_r, std_r, mean_c, std_c, mean_r - mean_c,
+            axis_name, li,
+            stats["mean_refusing"], stats["std_refusing"],
+            stats["mean_compliant"], stats["std_compliant"],
+            stats["separation"],
         )
 
     return per_layer_axes, per_layer_stats, refusing_acts, compliant_acts
@@ -1003,13 +993,8 @@ def orthogonalize_compliance_axes(
         len(benign_prompts), cap_layers[0], cap_layers[-1],
     )
 
-    # Only need to collect benign activations — refusing/compliant are reused
-    benign_acts = {li: [] for li in cap_layers}
-    for prompt in tqdm(benign_prompts, desc="  Benign activations", leave=False):
-        ids = exp.tokenize(prompt)
-        acts, _ = exp.get_baseline_trajectory(ids)
-        for li in cap_layers:
-            benign_acts[li].append(acts[li].float())
+    # Only need to collect benign activations -- refusing/compliant are reused
+    benign_acts = _collect_layer_activations(exp, benign_prompts, cap_layers, "  Benign activations")
 
     orth_axes = {}
     orth_stats = {}
@@ -1030,30 +1015,14 @@ def orthogonalize_compliance_axes(
         _assert_orthogonal(orth, benign_dir, f"orthogonalized compliance axis L{li} vs benign_dir")
         orth_axes[li] = orth.cpu()
 
-        # Recompute threshold stats on the orthogonalized axis
         refusing_stack = torch.stack(refusing_acts[li])
         compliant_stack = torch.stack(compliant_acts[li])
-        refusing_projs = (refusing_stack @ orth).numpy()
-        compliant_projs = (compliant_stack @ orth).numpy()
-        mean_r = float(refusing_projs.mean())
-        mean_c = float(compliant_projs.mean())
-        std_r = float(refusing_projs.std())
-        std_c = float(compliant_projs.std())
-        p25 = float(np.percentile(np.concatenate([refusing_projs, compliant_projs]), 25))
-        orth_stats[li] = {
-            "mean_refusing":  mean_r,
-            "mean_compliant": mean_c,
-            "std_refusing":   std_r,
-            "std_compliant":  std_c,
-            "optimal":        (mean_r + mean_c) / 2.0,
-            "mean+std":       mean_c + std_c,
-            "p25":            p25,
-            "separation":     mean_r - mean_c,
-        }
+        stats = _projection_stats(refusing_stack, compliant_stack, orth)
+        orth_stats[li] = stats
 
         logger.info(
             "  L%d: cos(comp,benign)=%.3f -> %.6f  sep=%.1f",
-            li, overlap, (orth @ benign_dir).item(), mean_r - mean_c,
+            li, overlap, (orth @ benign_dir).item(), stats["separation"],
         )
 
     return orth_axes, orth_stats
