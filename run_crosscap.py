@@ -86,7 +86,6 @@ import torch
 from crosscap_experiment import (
     SteeringExperiment,                     # loads model + axis
     load_original_capping,                  # loads the original paper's exact axes + thresholds
-    compute_discriminative_thresholds,      # finds per-layer firing thresholds
     compute_cross_detect_thresholds,        # recomputes cross-cap detection tau on YOUR data
     compute_pca_compliance_axis,            # builds compliance axis via PCA
     compute_mean_diff_compliance_axis,      # builds compliance axis via mean difference
@@ -189,7 +188,6 @@ DETERMINISTIC = True                # lock down randomness for reproducibility
 # (8 layers, roughly 72-84% of the way through the network).
 CAP_LAYERS = list(range(46, 54))
 
-SEED          = 42                  # random seed
 TEMPERATURE   = 1.0                 # generation temperature (irrelevant when do_sample=False)
 DO_SAMPLE     = False               # False = greedy decoding (always pick the most likely token)
 

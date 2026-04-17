@@ -14,7 +14,7 @@ run_crosscap.py is the person using the tools.
         │     Uses: SteeringExperiment        -- loads the model + assistant axis
         │     Uses: compute_pca_compliance_axis / compute_mean_diff_compliance_axis
         │                                      -- builds the second (correction) axis
-        │     Uses: compute_discriminative_thresholds
+        │     Uses: compute_cross_detect_thresholds
         │                                      -- finds per-layer firing thresholds
         │
         └── GENERATION PHASE (per prompt)
@@ -48,11 +48,12 @@ run_crosscap.py is the person using the tools.
           toward refusal along a direction learned from PCA)
       This separation is the core hypothesis of the experiment.
 
-  compute_discriminative_thresholds
-      Runs a batch of benign and jailbreak prompts through the model,
-      measures where their projection distributions land on each axis,
-      and picks a threshold halfway between the two means. This is the
-      "decision boundary" that tells the capping hooks when to fire.
+  compute_cross_detect_thresholds
+      Runs a batch of benign and jailbreak prompts through the model and
+      records their projections onto the assistant axis. Picks a
+      percentile-based cutoff on the benign distribution (default: 5th
+      percentile) as the cross-cap detection threshold. This is the
+      "decision boundary" that tells the cross-cap hook when to fire.
 
   compute_pca_compliance_axis / compute_mean_diff_compliance_axis
       Two ways to build the correction axis for cross-axis capping:
@@ -303,7 +304,6 @@ class SteeringExperiment:
         self,
         model_name: str,                        # HuggingFace model ID, e.g. "Qwen/Qwen3-32B"
         axis_path: Optional[str] = None,         # path to assistant axis .pt file (None = auto-download)
-        device: Optional[str] = None,            # unused for now -- device_map="auto" handles placement
         dtype: torch.dtype = torch.bfloat16,     # half-precision to fit large models in GPU memory
         deterministic: bool = False,             # if True, disable cuDNN non-determinism
     ):
@@ -635,155 +635,18 @@ class _CrossAxisCappingHook:
 # Threshold computation
 # ---------------------------------------------------------------------------
 #
-# Before we can cap, we need to know *when* to fire. The idea:
-#   1. Run a batch of benign prompts and record their projection values.
-#   2. Run a batch of jailbreak prompts and record theirs.
-#   3. Set the threshold at the midpoint between the two distributions.
+# Before cross-cap can fire, we need to know *when* to fire. The idea:
+#   1. Run a batch of benign prompts and record their assistant-axis
+#      projections at the last token position.
+#   2. Pick a cutoff on the benign distribution (default: 5th percentile)
+#      as the detection tau. By construction, <=5% of benign prompts trip
+#      the gate.
 #
-# This way, benign prompts (which project high on the assistant axis)
-# mostly stay above the threshold (no capping), while jailbreak prompts
-# (which project low) fall below it and get corrected.
+# Jailbreak prompts are run too, but only for diagnostic stats (means,
+# separation) -- the threshold itself is defined purely on the benign side
+# so it's calibrated to "how aggressive are we willing to be on benign
+# traffic" rather than to any particular jailbreak distribution.
 # ---------------------------------------------------------------------------
-
-def _collect_projections(
-    exp: SteeringExperiment,
-    prompts: list[str],
-    axis_directions: dict[str, dict[int, torch.Tensor]],
-    cap_layers: list[int],
-    max_new_tokens: int = 64,
-    label: str = "",
-) -> dict[str, dict[int, list[float]]]:
-    """Run prompts through the model and record projection values at each
-    cap layer for each axis.
-
-    This is a helper used by compute_discriminative_thresholds -- it
-    generates text for each prompt while tracking projections, then
-    returns all the recorded values so we can compute statistics.
-
-    Args:
-        axis_directions: maps axis_name -> layer_idx -> unit vector for that layer.
-
-    Returns:
-        projs[axis_name][layer_idx] = list of floats (one per generation step
-        across all prompts).
-    """
-    # Pre-allocate empty lists for every (axis, layer) combination
-    projs: dict[str, dict[int, list[float]]] = {
-        name: {layer_idx: [] for layer_idx in cap_layers}
-        for name in axis_directions
-    }
-    desc = f"  {label}" if label else "Collecting"
-    for prompt in tqdm(prompts, desc=desc, leave=False):
-        input_ids = exp.tokenize(prompt)
-
-        # Attach a tracker to every (axis, layer) pair, using the
-        # layer-specific axis vector for each
-        with ExitStack() as stack:
-            trackers: dict[tuple, _AxisProjectionTracker] = {}
-            for axis_name, per_layer in axis_directions.items():
-                for layer_idx in cap_layers:
-                    t = _AxisProjectionTracker(exp.layers[layer_idx], per_layer[layer_idx])
-                    stack.enter_context(t)
-                    trackers[(axis_name, layer_idx)] = t
-
-            # Generate (we don't need the output text, just the projections)
-            attention_mask = torch.ones_like(input_ids)
-            with torch.inference_mode():
-                exp.model.generate(
-                    input_ids,
-                    attention_mask=attention_mask,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=False,
-                )
-
-        # Collect all recorded projections from this prompt
-        for (axis_name, layer_idx), tracker in trackers.items():
-            projs[axis_name][layer_idx].extend(tracker.projections)
-    return projs
-
-
-def compute_discriminative_thresholds(
-    exp: SteeringExperiment,
-    benign_prompts: list[str],
-    jailbreak_prompts: list[str],
-    axis_directions: dict[str, dict[int, torch.Tensor]],
-    cap_layers: list[int],
-    max_new_tokens: int = 64,
-) -> dict[str, dict[int, dict[str, float]]]:
-
-
-
-
-    """Find the per-layer threshold that best separates benign from jailbreak
-    prompts on each axis.
-
-    Strategy: set tau = midpoint of (mean_benign, mean_jailbreak). This is
-    a simple linear discriminant -- prompts whose projection falls below tau
-    will be treated as potential jailbreaks and get capped.
-
-    Also records stats (means, stds, separation) so the caller can log them
-    and save them to metadata.
-
-    Returns:
-        thresholds[axis_name][layer_idx] = {
-            "optimal":        the midpoint threshold (tau),
-            "mean_benign":    average projection for benign prompts,
-            "mean_jailbreak": average projection for jailbreak prompts,
-            "std_benign":     standard deviation for benign,
-            "std_jailbreak":  standard deviation for jailbreak,
-            "separation":     gap between the two means (bigger = easier to tell apart),
-        }
-    """
-
-
-
-
-    logger.info(
-        "Computing discriminative thresholds at L%d-L%d "
-        "(%d benign, %d jailbreak prompts)...",
-        cap_layers[0], cap_layers[-1],
-        len(benign_prompts), len(jailbreak_prompts),
-    )
-
-    # Step 1: collect projection values from both prompt sets
-    benign_projs    = _collect_projections(exp, benign_prompts,    axis_directions, cap_layers, max_new_tokens, label="Benign")
-    jailbreak_projs = _collect_projections(exp, jailbreak_prompts, axis_directions, cap_layers, max_new_tokens, label="Jailbreak")
-
-    # Step 2: for each (axis, layer), compute the midpoint threshold
-    thresholds: dict[str, dict[int, dict[str, float]]] = {}
-    for axis_name in axis_directions:
-        thresholds[axis_name] = {}
-        for layer_idx in cap_layers:
-            b_arr = np.array(benign_projs[axis_name][layer_idx],   dtype=np.float32)
-            j_arr = np.array(jailbreak_projs[axis_name][layer_idx], dtype=np.float32)
-            mean_b, mean_j = float(b_arr.mean()), float(j_arr.mean())
-            tau = (mean_b + mean_j) / 2.0     # midpoint = decision boundary
-            separation = mean_b - mean_j       # how well-separated the two classes are
-            combined = np.concatenate([b_arr, j_arr])
-            thresholds[axis_name][layer_idx] = {
-                "optimal":        tau,
-                "p25":            float(np.percentile(combined, 25)),
-                "mean_benign":    mean_b,
-                "mean_jailbreak": mean_j,
-                "std_benign":     float(b_arr.std()),
-                "std_jailbreak":  float(j_arr.std()),
-                "separation":     separation,
-            }
-
-        # Log the first and last cap layers for a quick sanity check
-        for layer_idx in [cap_layers[0], cap_layers[-1]]:
-            d = thresholds[axis_name][layer_idx]
-            logger.info(
-                "  %s L%d: benign=%.1f+/-%.1f  jailbreak=%.1f+/-%.1f  "
-                "sep=%.1f  tau=%.1f",
-                axis_name, layer_idx,
-                d["mean_benign"], d["std_benign"],
-                d["mean_jailbreak"], d["std_jailbreak"],
-                d["separation"], d["optimal"],
-            )
-
-    return thresholds
-
 
 def compute_cross_detect_thresholds(
     exp: "SteeringExperiment",

@@ -207,7 +207,6 @@ These live at the top of `run_crosscap.py`:
 |---|---|---|
 | `MODEL_NAME` | `Qwen/Qwen3-32B` | Which model to cap |
 | `CAP_LAYERS` | L46--L53 (8 layers) | Where in the network capping is applied (72--84% depth) |
-| `SEED` | 42 | Random seed for reproducibility |
 | `AXIS_METHOD` | `pca` | How the compliance axis is built (`pca` or `mean_diff`) |
 
 ## How Capping Works (briefly)
