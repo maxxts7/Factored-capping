@@ -834,17 +834,18 @@ def compute_ff_detect_thresholds(
     UPPER percentile of the benign distribution (not a lower percentile like
     the assistant-axis detect tau).
 
-    Methods (all data-driven on the FF-benign calibration slice):
-      - "benign-p90": tau = 90th percentile (<=10% benign FP; most permissive)
+    Methods (all data-driven on the FF-benign calibration slice; listed from
+    most aggressive to most selective):
+      - "benign-p25": tau = 25th percentile (~75% benign FP; very aggressive, fires on most prompts)
+      - "benign-p50": tau = 50th percentile (~50% benign FP; aggressive)
+      - "benign-p75": tau = 75th percentile (~25% benign FP; moderate)
+      - "benign-p90": tau = 90th percentile (<=10% benign FP)
       - "benign-p95": tau = 95th percentile (<= 5% benign FP)
-      - "benign-p99": tau = 99th percentile (<= 1% benign FP; default, most selective)
+      - "benign-p99": tau = 99th percentile (<= 1% benign FP; most selective)
 
-    Returns:
-        taus:  {layer_idx -> tau (float)}
-        stats: {layer_idx -> {
-            "mean_benign", "std_benign",
-            "p90_benign", "p95_benign", "p99_benign",
-        }}
+    Note: FP rates are calibrated on FF-benign prompts; eval-time benign
+    distribution (e.g. AlpacaEval) may project far from FF-benign, so actual
+    benign fire rate at runtime can be much higher than the calibration FP.
     """
     logger.info(
         "Computing FF-cap detection thresholds on FF axis at "
@@ -861,31 +862,29 @@ def compute_ff_detect_thresholds(
             v = ff_axes[li].float().to(h_last.device)
             benign_projs[li].append((h_last @ v).item())
 
+    _PERCENTILES = {
+        "benign-p25": 25,
+        "benign-p50": 50,
+        "benign-p75": 75,
+        "benign-p90": 90,
+        "benign-p95": 95,
+        "benign-p99": 99,
+    }
+    if method not in _PERCENTILES:
+        raise ValueError(
+            f"Unknown ff-detect method: {method!r} "
+            f"(expected one of {sorted(_PERCENTILES)})"
+        )
+
     taus: dict[int, float] = {}
     stats: dict[int, dict[str, float]] = {}
     for li in cap_layers:
         b = np.asarray(benign_projs[li], dtype=np.float32)
-        p90_b = float(np.percentile(b, 90))
-        p95_b = float(np.percentile(b, 95))
-        p99_b = float(np.percentile(b, 99))
-        stats[li] = {
-            "mean_benign": float(b.mean()),
-            "std_benign":  float(b.std()),
-            "p90_benign":  p90_b,
-            "p95_benign":  p95_b,
-            "p99_benign":  p99_b,
-        }
-        if method == "benign-p90":
-            taus[li] = p90_b
-        elif method == "benign-p95":
-            taus[li] = p95_b
-        elif method == "benign-p99":
-            taus[li] = p99_b
-        else:
-            raise ValueError(
-                f"Unknown ff-detect method: {method!r} "
-                "(expected benign-p90, benign-p95, or benign-p99)"
-            )
+        stat = {"mean_benign": float(b.mean()), "std_benign": float(b.std())}
+        for name, pct in _PERCENTILES.items():
+            stat[f"p{pct}_benign"] = float(np.percentile(b, pct))
+        stats[li] = stat
+        taus[li] = stat[f"p{_PERCENTILES[method]}_benign"]
 
     for li in [cap_layers[0], cap_layers[-1]]:
         s = stats[li]
