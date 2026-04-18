@@ -181,6 +181,23 @@ PRESETS = {
         "OUTPUT_DIR": "results/crosscap_full_meandiff",
         "AXIS_METHOD": "mean_diff",
     },
+    # Targeted FF evaluation: 10 held-out fictional-framing prompts from
+    # fictional_framing_sample10.jsonl as the jailbreak source. Everything
+    # else (axes, benign eval, thresholds) stays at full-preset values so
+    # the FF axis is well-specified and this slice tests whether it fires
+    # on prompts it is designed to catch.
+    "ff_sample10": {
+        "N_PROMPTS": 10,
+        "N_CALIBRATION": 50,
+        "N_COMPLIANCE": 50,
+        "N_DETECT_CAL": 50,
+        "N_BENIGN_EVAL": 10,
+        "N_FF_COMPLIANCE": 200,
+        "N_FF_DETECT_CAL": 100,
+        "MAX_NEW_TOKENS": 256,
+        "OUTPUT_DIR": "results/crosscap_ff_sample10",
+        "JB_JSONL_PATH": "fictional_framing_sample10.jsonl",
+    },
 }
 
 
@@ -439,6 +456,23 @@ def load_jailbreak_dataset(n_prompts=None):
     return behaviors
 
 
+def _load_adversarial_jsonl(path: Path) -> list[dict]:
+    """Load a JSONL file with schema {id: int, adversarial: str}.
+
+    Returns a list of {"id", "text"} dicts preserving input order (no shuffle)
+    so slicing is deterministic across warmup and chunk workers.
+    """
+    rows = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            rows.append({"id": int(row["id"]), "text": row["adversarial"]})
+    return rows
+
+
 def load_ff_datasets(repo_root: Path) -> tuple[list[dict], list[dict]]:
     """Load the pre-curated fictional-framing (FF) datasets.
 
@@ -446,35 +480,43 @@ def load_ff_datasets(repo_root: Path) -> tuple[list[dict], list[dict]]:
       - classified_fictional_framing.jsonl  (~61 FF-jailbreak prompts)
       - classified_ff_benign.jsonl          (~1803 FF-style but benign prompts)
 
-    Returns two parallel lists of {"id": int, "text": str} dicts, preserving
-    JSONL order (no shuffle) so slicing is deterministic across warmup and
-    chunk workers. The id field is kept so callers can check for overlap
-    with the WildJailbreak eval set (data-leakage guard).
+    Returns two parallel lists of {"id": int, "text": str} dicts. The id
+    field is kept so callers can check for overlap with eval sets
+    (data-leakage guard).
     """
     ff_jb_path = repo_root / "classified_fictional_framing.jsonl"
     ff_benign_path = repo_root / "classified_ff_benign.jsonl"
 
-    def _read(path: Path) -> list[dict]:
-        rows = []
-        with path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                row = json.loads(line)
-                rows.append({"id": int(row["id"]), "text": row["adversarial"]})
-        return rows
-
     with _loading(str(ff_jb_path)):
-        ff_jb = _read(ff_jb_path)
+        ff_jb = _load_adversarial_jsonl(ff_jb_path)
     with _loading(str(ff_benign_path)):
-        ff_benign = _read(ff_benign_path)
+        ff_benign = _load_adversarial_jsonl(ff_benign_path)
 
     logger.info(
         "Loaded FF datasets: %d jailbreak, %d benign",
         len(ff_jb), len(ff_benign),
     )
     return ff_jb, ff_benign
+
+
+def load_jailbreak_jsonl(repo_root: Path, filename: str, n_prompts: int | None = None) -> list[dict]:
+    """Load jailbreak eval prompts from an arbitrary JSONL file at repo root.
+
+    Used by presets that override the default WildJailbreak eval source via
+    the JB_JSONL_PATH config key. Returns dicts matching load_jailbreak_dataset's
+    shape ({id, goal, vanilla, category}) so downstream code doesn't branch.
+    """
+    path = repo_root / filename
+    with _loading(str(path)):
+        rows = _load_adversarial_jsonl(path)
+    if n_prompts is not None:
+        rows = rows[:n_prompts]
+    behaviors = [
+        {"id": r["id"], "goal": r["text"], "vanilla": "", "category": "custom_jsonl"}
+        for r in rows
+    ]
+    logger.info("Loaded %d jailbreak prompts from %s", len(behaviors), filename)
+    return behaviors
 
 
 # ============================================================
@@ -687,12 +729,18 @@ def build_prompts(cfg):
     """Load jailbreak + benign prompts and merge them into one list.
 
     Returns a list of dicts, each with keys: idx, text, type.
-    Jailbreak prompts come from WildJailbreak eval split;
-    benign prompts come from AlpacaEval (a standard benchmark), kept
-    separate from the hardcoded CALIBRATION_PROMPTS used for threshold
-    calibration so that calibration and evaluation don't overlap.
+    Jailbreak prompts come from WildJailbreak eval split by default; presets
+    can override via JB_JSONL_PATH to point at a custom JSONL file at the
+    repo root (schema: {id, adversarial}). Benign prompts come from
+    AlpacaEval (a standard benchmark), kept separate from the hardcoded
+    CALIBRATION_PROMPTS used for threshold calibration so that calibration
+    and evaluation don't overlap.
     """
-    behaviors = load_jailbreak_dataset(n_prompts=cfg["N_PROMPTS"])
+    jb_jsonl = cfg.get("JB_JSONL_PATH")
+    if jb_jsonl:
+        behaviors = load_jailbreak_jsonl(REPO_ROOT, jb_jsonl, n_prompts=cfg["N_PROMPTS"])
+    else:
+        behaviors = load_jailbreak_dataset(n_prompts=cfg["N_PROMPTS"])
     benign = load_alpaca_eval(n_prompts=cfg["N_BENIGN_EVAL"])
 
     prompts = []
@@ -938,20 +986,25 @@ def _compute_warmup_state(exp, cfg) -> dict:
 
     print(f"\nBuilding FF axis (mean-diff) from pre-curated JSONL files...")
     ff_jb_rows, ff_benign_rows = load_ff_datasets(REPO_ROOT)
-
-    # Data-leakage guard: FF-jb IDs must not overlap WJ-eval IDs.
-    # The WJ eval loader enumerates adversarial_harmful rows in order;
-    # FF-jb IDs (50142, 50381, ...) look like WJ-train indices, so the
-    # intersection should be empty -- assert it to catch future changes.
-    wj_eval = load_jailbreak_dataset(n_prompts=cfg["N_PROMPTS"])
-    wj_eval_ids = {b["id"] for b in wj_eval}
     ff_jb_ids = {r["id"] for r in ff_jb_rows}
-    overlap = ff_jb_ids & wj_eval_ids
+
+    # Data-leakage guard: FF-jb IDs must not overlap with the jailbreak
+    # evaluation set (whatever source it comes from). FF-jb is used to build
+    # the FF axis, so any overlap would leak eval prompts into training.
+    jb_jsonl = cfg.get("JB_JSONL_PATH")
+    if jb_jsonl:
+        eval_rows = load_jailbreak_jsonl(REPO_ROOT, jb_jsonl, n_prompts=cfg["N_PROMPTS"])
+        eval_label = jb_jsonl
+    else:
+        eval_rows = load_jailbreak_dataset(n_prompts=cfg["N_PROMPTS"])
+        eval_label = "WJ-eval"
+    eval_ids = {b["id"] for b in eval_rows}
+    overlap = ff_jb_ids & eval_ids
     if overlap:
         raise AssertionError(
-            f"FF-jb / WJ-eval ID overlap detected ({len(overlap)} rows: "
+            f"FF-jb / {eval_label} ID overlap detected ({len(overlap)} rows: "
             f"{sorted(overlap)[:5]}...). This would leak eval prompts into "
-            f"axis construction. Remove the overlapping rows before continuing."
+            f"FF axis construction. Remove the overlapping rows before continuing."
         )
 
     # Slice the FF-benign set into disjoint calibration / axis-build halves.
