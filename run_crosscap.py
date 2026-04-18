@@ -612,6 +612,11 @@ def run_experiment(
             "ff_cross_cap_push_trace": _format_push_trace(
                 ff_per_layer_events, ff_cross_ids, prompt_len, exp.tokenizer
             ) if ff_cross_ids is not None else "",
+            # Did the FF gate trip at all during the prompt (any layer, any step)?
+            # True = the FF axis contributed at least one detection firing.
+            # Independent of whether correction was actually applied -- the
+            # compliance-axis gate can still veto a push even after detection.
+            "ff_axis_fired": "Yes" if ff_n_ff > 0 else "No",
             # Per-layer gate attribution: "L46=A3,F2,B1;L47=A1,F0,B0".
             # A = assistant gate fired, F = FF gate fired, B = both fired.
             # In OR mode, F-only fires (A - B vs F - B) are the new signal
@@ -727,8 +732,10 @@ def save_results(df, output_dir, args, cos_val, cfg, elapsed, cap_layers,
         out["capped_text"] = subset[f"{method}_cap_text"]              # the actual output text
         out["fires_per_layer"] = subset[f"{method}_cap_fires_per_layer"]
         out["push_trace"]      = subset[f"{method}_cap_push_trace"]
-        # ff-cross-cap additionally records which gate (assistant / FF / both) fired
+        # ff-cross-cap additionally records whether the FF gate tripped and
+        # which gate (assistant / FF / both) fired per layer.
         if method == "ff_cross":
+            out["ff_axis_fired"] = subset["ff_axis_fired"]             # Yes/No
             out["gate_attribution"] = subset["ff_cross_cap_gate_attribution"]
         out.to_csv(path, index=False)
         return out
