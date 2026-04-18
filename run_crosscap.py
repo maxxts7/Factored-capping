@@ -1318,9 +1318,9 @@ def main():
     print(f"Preset: {args.preset}")
     print(f"Model: {MODEL_NAME}")
     print(f"Compliance threshold: {args.compliance_threshold}")
-    print(f"Cross-cap detect method: {args.cross_detect_method}  "
+    print(f"Cross-cap detect method: {cfg['CROSS_DETECT_METHOD']}  "
           f"(n_detect_cal={cfg['N_DETECT_CAL']})")
-    print(f"FF-cap detect method:    {args.ff_detect_method}  "
+    print(f"FF-cap detect method:    {cfg['FF_DETECT_METHOD']}  "
           f"(n_ff_compliance={cfg['N_FF_COMPLIANCE']}, "
           f"n_ff_detect_cal={cfg['N_FF_DETECT_CAL']})")
     print(f"Orthogonalize: {cfg['ORTHOGONALIZE']}")
