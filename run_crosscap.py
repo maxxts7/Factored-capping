@@ -123,6 +123,9 @@ logger = logging.getLogger("crosscap")
 #                       FF-axis construction (FF-jb uses all 61 prompts)
 #   N_FF_DETECT_CAL  -- how many held-out FF-benign prompts used for FF tau
 #                       calibration (disjoint from N_FF_COMPLIANCE slice)
+#   N_BENIGN_FF_TAIL -- optional: append the tail N rows of classified_ff_benign.jsonl
+#                       to the benign eval set (on top of AlpacaEval). Asserted
+#                       disjoint from the axis and tau-calibration slices.
 #   MAX_NEW_TOKENS   -- max tokens the model can generate per prompt
 #   OUTPUT_DIR       -- where to save CSVs and metadata
 #
@@ -193,6 +196,7 @@ PRESETS = {
         "N_COMPLIANCE": 50,
         "N_DETECT_CAL": 50,
         "N_BENIGN_EVAL": 10,
+        "N_BENIGN_FF_TAIL": 10,    # append last 10 rows of classified_ff_benign.jsonl
         "N_FF_COMPLIANCE": 200,
         "N_FF_DETECT_CAL": 100,
         "MAX_NEW_TOKENS": 256,
@@ -733,10 +737,14 @@ def build_prompts(cfg):
     Returns a list of dicts, each with keys: idx, text, type.
     Jailbreak prompts come from WildJailbreak eval split by default; presets
     can override via JB_JSONL_PATH to point at a custom JSONL file at the
-    repo root (schema: {id, adversarial}). Benign prompts come from
-    AlpacaEval (a standard benchmark), kept separate from the hardcoded
-    CALIBRATION_PROMPTS used for threshold calibration so that calibration
-    and evaluation don't overlap.
+    repo root (schema: {id, adversarial}).
+
+    Benign prompts come from AlpacaEval (N_BENIGN_EVAL rows); presets can
+    optionally append the tail N_BENIGN_FF_TAIL rows of classified_ff_benign.jsonl
+    as additional benign eval prompts -- useful for stress-testing the FF
+    axis against in-distribution benign prompts that look like fictional
+    framing. The tail slice is guarded against overlap with the FF axis
+    construction and tau-calibration slices.
     """
     jb_jsonl = cfg.get("JB_JSONL_PATH")
     if jb_jsonl:
@@ -750,6 +758,27 @@ def build_prompts(cfg):
         prompts.append({"idx": b["id"], "text": b["goal"], "type": "jailbreak"})
     for i, p in enumerate(benign):
         prompts.append({"idx": i, "text": p, "type": "benign"})
+
+    n_ff_tail = cfg.get("N_BENIGN_FF_TAIL", 0)
+    if n_ff_tail > 0:
+        ff_benign_path = REPO_ROOT / "classified_ff_benign.jsonl"
+        with _loading(str(ff_benign_path)):
+            ff_rows = _load_adversarial_jsonl(ff_benign_path)
+        # Guard: tail slice must not overlap with the [0:n_cal] and
+        # [n_cal:n_cal+n_comp] slices consumed by the FF axis pipeline.
+        n_cal = cfg["N_FF_DETECT_CAL"]
+        n_comp = cfg["N_FF_COMPLIANCE"]
+        if len(ff_rows) - n_ff_tail < n_cal + n_comp:
+            raise ValueError(
+                f"FF-benign tail slice of {n_ff_tail} rows overlaps FF "
+                f"axis/cal slices: need {n_ff_tail + n_cal + n_comp} "
+                f"distinct rows but have {len(ff_rows)}."
+            )
+        tail_rows = ff_rows[-n_ff_tail:]
+        logger.info("Loaded %d FF-benign tail prompts for benign eval", len(tail_rows))
+        for r in tail_rows:
+            prompts.append({"idx": r["id"], "text": r["text"], "type": "benign"})
+
     return prompts
 
 
