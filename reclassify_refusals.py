@@ -258,6 +258,8 @@ def find_csvs(input_dir: Path) -> list[Path]:
         "assistant_cap_benign*.csv",
         "cross_cap_jailbreak*.csv",
         "cross_cap_benign*.csv",
+        "ff_cross_cap_jailbreak*.csv",
+        "ff_cross_cap_benign*.csv",
     ]
     found = []
     for pat in patterns:

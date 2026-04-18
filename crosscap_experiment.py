@@ -623,6 +623,101 @@ class _CrossAxisCappingHook:
             self._handle = None
 
 
+class _FFCrossAxisCappingHook(_CrossAxisCappingHook):
+    """Cross-axis capping with an additional FF-axis detection signal (OR-gate).
+
+    Extends the cross-cap hook by adding a second detection axis: the
+    fictional-framing (FF) axis, learned from FF-jailbreak vs FF-benign
+    activations. The detection gate opens if EITHER:
+      - the assistant axis trips (h @ v_assist < tau_detect), OR
+      - the FF axis trips     (h @ v_ff   > tau_ff)
+
+    The correction branch is identical to the parent: same compliance axis,
+    same correct threshold. Only the detection gate changes.
+
+    Three axes live in this hook with three sign conventions -- watch out:
+      v_assist      LOW projection  = jailbreak-like  -> fire when < tau_detect
+      v_ff          HIGH projection = FF-jb-like      -> fire when > tau_ff
+      v_compliance  HIGH projection = refusing (safe) -> correct when < tau_correct
+
+    Extra telemetry: n_assist_fired, n_ff_fired, n_both_fired let the
+    caller attribute which gate contributed to each firing.
+    """
+
+    def __init__(
+        self,
+        layer_module: nn.Module,
+        detect_axis: torch.Tensor,
+        detect_threshold: float,
+        correct_axis: torch.Tensor,
+        correct_threshold: float,
+        ff_axis: torch.Tensor,
+        ff_threshold: float,
+    ):
+        super().__init__(
+            layer_module,
+            detect_axis, detect_threshold,
+            correct_axis, correct_threshold,
+        )
+        self._ff_axis = ff_axis.float()
+        _assert_unit_norm(self._ff_axis, "FF axis")
+        self._tau_ff = ff_threshold
+        self._ff_device: Optional[torch.Tensor] = None
+        self.n_assist_fired = 0      # assistant axis tripped (regardless of FF)
+        self.n_ff_fired = 0          # FF axis tripped (regardless of assistant)
+        self.n_both_fired = 0        # both tripped simultaneously
+
+    def __enter__(self):
+        def hook_fn(module, input, output):
+            if torch.is_tensor(output):
+                h = output
+            else:
+                h = output[0]
+
+            h_last = h[0, -1, :].float()
+
+            # Move axes to h.device on first call
+            if self._detect_device is None:
+                self._detect_device = self._detect_axis.to(h.device)
+                self._correct_device = self._correct_axis.to(h.device)
+            if self._ff_device is None:
+                self._ff_device = self._ff_axis.to(h.device)
+
+            # --- GATE 1: OR-combined detection ---
+            detect_proj = (h_last @ self._detect_device).item()
+            ff_proj = (h_last @ self._ff_device).item()
+            assist_fires = detect_proj < self._tau_detect
+            ff_fires = ff_proj > self._tau_ff
+
+            if assist_fires:
+                self.n_assist_fired += 1
+            if ff_fires:
+                self.n_ff_fired += 1
+            if assist_fires and ff_fires:
+                self.n_both_fired += 1
+
+            if assist_fires or ff_fires:
+                self.n_triggered += 1
+
+                # --- GATE 2: Correction (unchanged from parent) ---
+                correct_proj = (h_last @ self._correct_device).item()
+                if correct_proj < self._tau_correct:
+                    push = self._tau_correct - correct_proj
+                    delta = push * self._correct_device.to(h.dtype)
+                    h[0, -1, :].add_(delta)
+                    self.n_corrected += 1
+                    self.correction_events.append((self._step_counter, push))
+
+            self._step_counter += 1
+
+            if torch.is_tensor(output):
+                return h
+            return (h, *output[1:])
+
+        self._handle = self._layer.register_forward_hook(hook_fn)
+        return self
+
+
 # ---------------------------------------------------------------------------
 # Threshold computation
 # ---------------------------------------------------------------------------
@@ -653,9 +748,7 @@ def compute_cross_detect_thresholds(
     The assistant axis vector is unchanged -- only the scalar cutoff used by
     the cross-cap detection gate is recomputed, so the gate fires on prompts
     that look jailbreak-like on YOUR eval distribution rather than on the
-    paper's calibration distribution. The paper's assistant_taus are kept
-    untouched for Mode 2 (single-axis assistant-cap), so the baseline
-    comparison stays fair.
+    paper's calibration distribution.
 
     Detection fires when (h_last @ v_assist) < tau. Lower tau = fires less
     often (less aggressive), which is the point of tuning this cutoff.
@@ -720,6 +813,84 @@ def compute_cross_detect_thresholds(
         s = stats[li]
         logger.info(
             "  detect-tau L%d: tau=%.2f  benign=%.2f+/-%.2f",
+            li, taus[li], s["mean_benign"], s["std_benign"],
+        )
+
+    return taus, stats
+
+
+def compute_ff_detect_thresholds(
+    exp: "SteeringExperiment",
+    benign_prompts: list[str],
+    ff_axes: dict[int, torch.Tensor],
+    cap_layers: list[int],
+    method: str = "benign-p99",
+) -> tuple[dict[int, float], dict[int, dict[str, float]]]:
+    """Per-layer FF-axis detection thresholds, calibrated on held-out FF-benign prompts.
+
+    Sign convention on the FF axis is inverted from the assistant axis:
+    HIGH projection = FF-jailbreak-like (fire direction); LOW = benign.
+    The gate fires when (h_last @ v_ff) > tau_ff, so tau is chosen as an
+    UPPER percentile of the benign distribution (not a lower percentile like
+    the assistant-axis detect tau).
+
+    Methods (all data-driven on the FF-benign calibration slice):
+      - "benign-p90": tau = 90th percentile (<=10% benign FP; most permissive)
+      - "benign-p95": tau = 95th percentile (<= 5% benign FP)
+      - "benign-p99": tau = 99th percentile (<= 1% benign FP; default, most selective)
+
+    Returns:
+        taus:  {layer_idx -> tau (float)}
+        stats: {layer_idx -> {
+            "mean_benign", "std_benign",
+            "p90_benign", "p95_benign", "p99_benign",
+        }}
+    """
+    logger.info(
+        "Computing FF-cap detection thresholds on FF axis at "
+        "L%d-L%d (%d benign, method=%s)...",
+        cap_layers[0], cap_layers[-1], len(benign_prompts), method,
+    )
+
+    benign_projs: dict[int, list[float]] = {li: [] for li in cap_layers}
+    for prompt in tqdm(benign_prompts, desc="  ff-detect-cal benign", leave=False):
+        ids = exp.tokenize(prompt)
+        hs, _ = exp.get_baseline_trajectory(ids)
+        for li in cap_layers:
+            h_last = hs[li].float()
+            v = ff_axes[li].float().to(h_last.device)
+            benign_projs[li].append((h_last @ v).item())
+
+    taus: dict[int, float] = {}
+    stats: dict[int, dict[str, float]] = {}
+    for li in cap_layers:
+        b = np.asarray(benign_projs[li], dtype=np.float32)
+        p90_b = float(np.percentile(b, 90))
+        p95_b = float(np.percentile(b, 95))
+        p99_b = float(np.percentile(b, 99))
+        stats[li] = {
+            "mean_benign": float(b.mean()),
+            "std_benign":  float(b.std()),
+            "p90_benign":  p90_b,
+            "p95_benign":  p95_b,
+            "p99_benign":  p99_b,
+        }
+        if method == "benign-p90":
+            taus[li] = p90_b
+        elif method == "benign-p95":
+            taus[li] = p95_b
+        elif method == "benign-p99":
+            taus[li] = p99_b
+        else:
+            raise ValueError(
+                f"Unknown ff-detect method: {method!r} "
+                "(expected benign-p90, benign-p95, or benign-p99)"
+            )
+
+    for li in [cap_layers[0], cap_layers[-1]]:
+        s = stats[li]
+        logger.info(
+            "  ff-detect-tau L%d: tau=%.2f  benign=%.2f+/-%.2f",
             li, taus[li], s["mean_benign"], s["std_benign"],
         )
 
@@ -905,6 +1076,95 @@ def compute_mean_diff_compliance_axis(
         )
 
     return per_layer_axes, per_layer_stats, refusing_acts, compliant_acts
+
+
+def compute_mean_diff_ff_axis(
+    exp: SteeringExperiment,
+    ff_jb_prompts: list[str],          # fictional-framing jailbreak prompts
+    ff_benign_prompts: list[str],      # fictional-framing-style but benign prompts
+    cap_layers: list[int],
+    axis_name: str = "mean_diff_ff",
+) -> tuple[dict[int, torch.Tensor], dict[int, dict[str, float]],
+           dict[int, list[torch.Tensor]], dict[int, list[torch.Tensor]]]:
+    """Fictional-framing (FF) axis via mean-diff: v_ff = (mean_ff_jb - mean_ff_benign).
+
+    Sign convention: HIGH projection = FF-jailbreak-like (fire direction);
+    LOW = FF-benign. This is the OPPOSITE of the assistant axis, where the
+    gate fires on LOW projections. See _FFCrossAxisCappingHook for how the
+    two conventions combine in the OR-gate.
+
+    Mean-diff (not PCA) because (a) the 61/1803 class imbalance would let
+    benign variance dominate PC1, and (b) binary contrast is the natural
+    fit for a "this vs that" direction.
+
+    Returns:
+        per_layer_axes:  dict mapping layer_idx -> unit vector on CPU
+        per_layer_stats: dict mapping layer_idx -> {
+            "mean_ff_jb", "mean_ff_benign", "std_ff_jb", "std_ff_benign",
+            "separation", "auroc"
+        }
+        ff_jb_acts:      collected jb activations (reused for per-subset ablations)
+        ff_benign_acts:  collected benign activations
+    """
+    logger.info(
+        "Computing %s mean-diff FF axes at L%d-L%d (%d ff-jb, %d ff-benign)...",
+        axis_name, cap_layers[0], cap_layers[-1],
+        len(ff_jb_prompts), len(ff_benign_prompts),
+    )
+
+    ff_jb_acts = _collect_layer_activations(exp, ff_jb_prompts, cap_layers, f"  {axis_name} ff-jb")
+    ff_benign_acts = _collect_layer_activations(exp, ff_benign_prompts, cap_layers, f"  {axis_name} ff-benign")
+
+    per_layer_axes = {}
+    per_layer_stats = {}
+    for li in cap_layers:
+        jb_stack = torch.stack(ff_jb_acts[li])
+        benign_stack = torch.stack(ff_benign_acts[li])
+        md = jb_stack.mean(0) - benign_stack.mean(0)
+        md = md / md.norm()
+        _assert_unit_norm(md, f"FF axis L{li}")
+        per_layer_axes[li] = md.cpu()
+
+        jb_projs = (jb_stack @ md).numpy()
+        benign_projs = (benign_stack @ md).numpy()
+        mean_jb = float(jb_projs.mean())
+        mean_benign = float(benign_projs.mean())
+        std_jb = float(jb_projs.std())
+        std_benign = float(benign_projs.std())
+        pooled_std = float(np.sqrt((std_jb ** 2 + std_benign ** 2) / 2.0))
+        sep_std = (mean_jb - mean_benign) / pooled_std if pooled_std > 0 else 0.0
+        # AUROC via rank-sum formula: P(jb_proj > benign_proj) for random pairs.
+        # Cheap sanity gauge of axis quality at this layer.
+        n_jb, n_bn = len(jb_projs), len(benign_projs)
+        combined = np.concatenate([jb_projs, benign_projs])
+        ranks = combined.argsort().argsort().astype(np.float64) + 1.0
+        rank_sum_jb = ranks[:n_jb].sum()
+        auroc = float((rank_sum_jb - n_jb * (n_jb + 1) / 2.0) / (n_jb * n_bn))
+
+        per_layer_stats[li] = {
+            "mean_ff_jb":     mean_jb,
+            "mean_ff_benign": mean_benign,
+            "std_ff_jb":      std_jb,
+            "std_ff_benign":  std_benign,
+            "separation":     mean_jb - mean_benign,
+            "separation_std": sep_std,
+            "auroc":          auroc,
+        }
+        # Sign assertion: by construction (mean_jb - mean_benign), jb side
+        # should project higher. Catches a silent flip if someone swaps args.
+        assert mean_jb >= mean_benign, (
+            f"FF axis L{li}: sign flip -- ff_jb ({mean_jb:.3f}) projects below "
+            f"ff_benign ({mean_benign:.3f})"
+        )
+
+        logger.info(
+            "  %s L%d: ff_jb=%.1f+/-%.1f  ff_benign=%.1f+/-%.1f  sep=%.1f  sep_std=%.2f  auroc=%.3f",
+            axis_name, li,
+            mean_jb, std_jb, mean_benign, std_benign,
+            mean_jb - mean_benign, sep_std, auroc,
+        )
+
+    return per_layer_axes, per_layer_stats, ff_jb_acts, ff_benign_acts
 
 
 def orthogonalize_compliance_axes(
@@ -1115,3 +1375,77 @@ def generate_cross_capped(
         if h.n_corrected > 0
     }
     return sequences, n_triggered, n_corrected, corrected_layers, per_layer_events
+
+
+def generate_ff_cross_capped(
+    exp: SteeringExperiment,
+    input_ids: torch.Tensor,
+    cap_layers: list[int],
+    per_layer_detect_axes: dict[int, torch.Tensor],   # per-layer assistant axes (detect gate 1)
+    correct_axes: dict[int, torch.Tensor],            # per-layer compliance axes (correction)
+    ff_axes: dict[int, torch.Tensor],                 # per-layer FF axes (detect gate 2)
+    detect_thresholds: dict[int, float],               # tau on assistant axis
+    correct_thresholds: dict[int, float],              # tau on compliance axis
+    ff_thresholds: dict[int, float],                   # tau on FF axis
+    max_new_tokens: int = 128,
+) -> tuple[torch.Tensor, int, int, int, int, list[int], dict[int, list[tuple[int, float]]],
+           dict[int, tuple[int, int, int]]]:
+    """Generate text with FF-cross-axis capping: OR-combined detection + compliance correction.
+
+    Detection gate fires if EITHER the assistant axis trips (proj < tau_detect)
+    OR the FF axis trips (proj > tau_ff). Correction is along the compliance
+    axis with the same `optimal75`-style threshold as cross-cap.
+
+    Returns:
+        sequences:          generated token IDs
+        n_assist_fired:     how many forward passes tripped the assistant gate (across all layers)
+        n_ff_fired:         how many tripped the FF gate
+        n_both_fired:       how many tripped both
+        n_corrected:        how many times correction was actually applied
+        corrected_layers:   which layers applied at least one correction
+        per_layer_events:   {layer_idx -> list[(step, magnitude)]} for layers with >=1 firing
+        gate_attribution:   {layer_idx -> (n_assist_fired, n_ff_fired, n_both_fired)}
+                            -- per-layer gate-attribution totals, exposed so the caller
+                            can report whether the FF axis contributed new fires
+                            beyond what the assistant axis already caught.
+    """
+    hooks = [
+        _FFCrossAxisCappingHook(
+            exp.layers[layer_idx],
+            per_layer_detect_axes[layer_idx], detect_thresholds[layer_idx],
+            correct_axes[layer_idx], correct_thresholds[layer_idx],
+            ff_axes[layer_idx], ff_thresholds[layer_idx],
+        )
+        for layer_idx in cap_layers
+    ]
+
+    with ExitStack() as stack:
+        for hook in hooks:
+            stack.enter_context(hook)
+
+        attention_mask = torch.ones_like(input_ids)
+        with torch.inference_mode():
+            sequences = exp.model.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+            )
+
+    n_assist_fired = sum(h.n_assist_fired for h in hooks)
+    n_ff_fired = sum(h.n_ff_fired for h in hooks)
+    n_both_fired = sum(h.n_both_fired for h in hooks)
+    n_corrected = sum(h.n_corrected for h in hooks)
+    corrected_layers = [li for li, h in zip(cap_layers, hooks) if h.n_corrected > 0]
+    per_layer_events = {
+        li: list(h.correction_events)
+        for li, h in zip(cap_layers, hooks)
+        if h.n_corrected > 0
+    }
+    gate_attribution = {
+        li: (h.n_assist_fired, h.n_ff_fired, h.n_both_fired)
+        for li, h in zip(cap_layers, hooks)
+        if (h.n_assist_fired + h.n_ff_fired) > 0
+    }
+    return (sequences, n_assist_fired, n_ff_fired, n_both_fired,
+            n_corrected, corrected_layers, per_layer_events, gate_attribution)

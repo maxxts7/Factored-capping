@@ -14,8 +14,9 @@ Think of it this way:
 
 For each prompt it generates THREE responses:
   1. baseline       -- uncapped model output (the control)
-  2. assistant-cap  -- detect and correct on the same assistant axis (existing method)
-  3. cross-cap      -- detect on assistant axis, correct on compliance axis (new idea)
+  2. cross-cap      -- detect on assistant axis, correct on compliance axis
+  3. ff-cross-cap   -- OR-gated detection (assistant axis OR fictional-framing
+                       axis), correction on compliance axis (the new method)
 
 === How to run it ===
 
@@ -51,21 +52,22 @@ Multi-GPU (recommended for the full 100-prompt run):
      Build the compliance axis (PCA or mean-diff)
      Compute per-layer COMPLIANCE thresholds from refusing/compliant projections
      Compute per-layer CROSS-CAP DETECTION thresholds on the assistant axis
-       from your own benign CALIBRATION_PROMPTS -- paper's assistant_taus
-       kept untouched for Mode 2
+       from your own benign CALIBRATION_PROMPTS
+     Build the FF axis (mean-diff on FF-jb vs held-out FF-benign)
+     Compute per-layer FF-CAP DETECTION thresholds on the FF axis
      Save everything to warmup.pt
 
   2. GENERATION (per prompt)
      Tokenize the prompt with chat template
-     Run generate_baseline()      -> uncapped text
-     Run generate_capped()        -> assistant-axis capped text
-     Run generate_cross_capped()  -> cross-axis capped text
+     Run generate_baseline()          -> uncapped text
+     Run generate_cross_capped()      -> cross-axis capped text
+     Run generate_ff_cross_capped()   -> FF-cross-axis capped text
      Record which layers fired and how many interventions occurred
 
   3. MERGE
      Concatenate chunk CSVs into 4 final files:
-       assistant_cap_jailbreak.csv, assistant_cap_benign.csv
-       cross_cap_jailbreak.csv, cross_cap_benign.csv
+       cross_cap_jailbreak.csv,    cross_cap_benign.csv
+       ff_cross_cap_jailbreak.csv, ff_cross_cap_benign.csv
      Write metadata.json with experiment config
 
   After this, you can run reclassify_refusals.py to have an LLM judge
@@ -90,10 +92,12 @@ from crosscap_experiment import (
     compute_cross_detect_thresholds,        # recomputes cross-cap detection tau on YOUR data
     compute_pca_compliance_axis,            # builds compliance axis via PCA
     compute_mean_diff_compliance_axis,      # builds compliance axis via mean difference
+    compute_mean_diff_ff_axis,              # builds fictional-framing axis via mean difference
+    compute_ff_detect_thresholds,           # calibrates FF-axis detection tau on held-out FF-benign
     orthogonalize_compliance_axes,          # remove benign component from compliance axes
     generate_baseline,                      # uncapped generation (control)
-    generate_capped,                        # single-axis capping
-    generate_cross_capped,                  # cross-axis capping (the new method)
+    generate_cross_capped,                  # cross-axis capping
+    generate_ff_cross_capped,               # FF-cross-axis capping (OR-gated with FF axis)
 )
 
 # Set up logging so all output has timestamps and severity levels
@@ -110,17 +114,20 @@ logger = logging.getLogger("crosscap")
 # ============================================================
 #
 # Each preset controls how big the experiment is:
-#   N_PROMPTS      -- how many jailbreak prompts to evaluate
-#   N_CALIBRATION  -- how many benign prompts to use for threshold computation
-#                     (these also get evaluated as the benign test set)
-#   N_COMPLIANCE   -- how many prompts per side (refusing + compliant) to use
-#                     when building the compliance axis
-#   MAX_NEW_TOKENS -- max tokens the model can generate per prompt
-#   OUTPUT_DIR     -- where to save CSVs and metadata
+#   N_PROMPTS        -- how many jailbreak prompts to evaluate
+#   N_CALIBRATION    -- how many benign prompts to use for threshold computation
+#                       (these also get evaluated as the benign test set)
+#   N_COMPLIANCE     -- how many prompts per side (refusing + compliant) to use
+#                       when building the compliance axis
+#   N_FF_COMPLIANCE  -- how many FF-benign prompts used as the benign side of
+#                       FF-axis construction (FF-jb uses all 61 prompts)
+#   N_FF_DETECT_CAL  -- how many held-out FF-benign prompts used for FF tau
+#                       calibration (disjoint from N_FF_COMPLIANCE slice)
+#   MAX_NEW_TOKENS   -- max tokens the model can generate per prompt
+#   OUTPUT_DIR       -- where to save CSVs and metadata
 #
 # Optional overrides:
-#   AXIS_METHOD    -- "pca" (default) or "mean_diff" for compliance axis
-#   CROSS_ONLY     -- if True, skip assistant-axis capping (only baseline + cross)
+#   AXIS_METHOD      -- "pca" (default) or "mean_diff" for compliance axis
 # ============================================================
 
 PRESETS = {
@@ -132,6 +139,8 @@ PRESETS = {
         "N_COMPLIANCE": 50,
         "N_DETECT_CAL": 50,       # benign CALIBRATION_PROMPTS used for detect-tau
         "N_BENIGN_EVAL": 10,
+        "N_FF_COMPLIANCE": 50,    # FF-benign slice used for axis-build benign side
+        "N_FF_DETECT_CAL": 100,   # held-out FF-benign slice used for FF-detect-tau
         "MAX_NEW_TOKENS": 256,    # matches full preset and the judge's assumption
         "OUTPUT_DIR": "results/crosscap_sanity",
     },
@@ -142,6 +151,8 @@ PRESETS = {
         "N_COMPLIANCE": 20,
         "N_DETECT_CAL": 50,
         "N_BENIGN_EVAL": 50,
+        "N_FF_COMPLIANCE": 50,
+        "N_FF_DETECT_CAL": 100,
         "MAX_NEW_TOKENS": 128,
         "OUTPUT_DIR": "results/crosscap_small",
     },
@@ -152,21 +163,23 @@ PRESETS = {
         "N_COMPLIANCE": 50,
         "N_DETECT_CAL": 50,
         "N_BENIGN_EVAL": 100,
+        "N_FF_COMPLIANCE": 200,
+        "N_FF_DETECT_CAL": 100,
         "MAX_NEW_TOKENS": 256,
         "OUTPUT_DIR": "results/crosscap_full",
     },
-    # Variant: same as "full" but uses mean-diff axis instead of PCA,
-    # and only runs cross-axis capping (no assistant-axis baseline)
+    # Variant: same as "full" but uses mean-diff compliance axis instead of PCA.
     "full_meandiff": {
         "N_PROMPTS": 250,
         "N_CALIBRATION": 50,
         "N_COMPLIANCE": 50,
         "N_DETECT_CAL": 50,
         "N_BENIGN_EVAL": 100,
+        "N_FF_COMPLIANCE": 200,
+        "N_FF_DETECT_CAL": 100,
         "MAX_NEW_TOKENS": 256,
         "OUTPUT_DIR": "results/crosscap_full_meandiff",
         "AXIS_METHOD": "mean_diff",
-        "CROSS_ONLY": True,
     },
 }
 
@@ -187,6 +200,10 @@ AXIS_PATH     = None                # None = auto-download the assistant axis fr
 # are strongest. For Qwen3-32B (64 layers total), that's L46-L53
 # (8 layers, roughly 72-84% of the way through the network).
 CAP_LAYERS = list(range(46, 54))
+
+# Repo root: parent of this script. Used to locate the pre-curated FF JSONL
+# files that ship alongside the code.
+REPO_ROOT = Path(__file__).resolve().parent
 
 
 # ============================================================
@@ -422,13 +439,51 @@ def load_jailbreak_dataset(n_prompts=None):
     return behaviors
 
 
+def load_ff_datasets(repo_root: Path) -> tuple[list[dict], list[dict]]:
+    """Load the pre-curated fictional-framing (FF) datasets.
+
+    Two files sit at the repo root, both JSONL with schema {id, adversarial}:
+      - classified_fictional_framing.jsonl  (~61 FF-jailbreak prompts)
+      - classified_ff_benign.jsonl          (~1803 FF-style but benign prompts)
+
+    Returns two parallel lists of {"id": int, "text": str} dicts, preserving
+    JSONL order (no shuffle) so slicing is deterministic across warmup and
+    chunk workers. The id field is kept so callers can check for overlap
+    with the WildJailbreak eval set (data-leakage guard).
+    """
+    ff_jb_path = repo_root / "classified_fictional_framing.jsonl"
+    ff_benign_path = repo_root / "classified_ff_benign.jsonl"
+
+    def _read(path: Path) -> list[dict]:
+        rows = []
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                rows.append({"id": int(row["id"]), "text": row["adversarial"]})
+        return rows
+
+    with _loading(str(ff_jb_path)):
+        ff_jb = _read(ff_jb_path)
+    with _loading(str(ff_benign_path)):
+        ff_benign = _read(ff_benign_path)
+
+    logger.info(
+        "Loaded FF datasets: %d jailbreak, %d benign",
+        len(ff_jb), len(ff_benign),
+    )
+    return ff_jb, ff_benign
+
+
 # ============================================================
 # UNIFIED EXPERIMENT LOOP
 # ============================================================
 #
 # This is the heart of the experiment. For each prompt it runs all three
-# generation modes (baseline, assistant-cap, cross-cap), decodes the
-# output text, and collects diagnostics into a DataFrame row.
+# generation modes (baseline, cross-cap, ff-cross-cap), decodes the output
+# text, and collects diagnostics into a DataFrame row.
 #
 # The caller (do_run or do_chunk) passes in the pre-computed axes and
 # thresholds; this function just iterates over prompts and calls the
@@ -441,13 +496,13 @@ def run_experiment(
     cap_layers: list[int],               # which layers to cap at (e.g. L46-L53)
     assistant_axes: dict[int, torch.Tensor],  # per-layer assistant axis vectors
     compliance_axes: dict[int, torch.Tensor], # per-layer compliance axis vectors
-    assistant_taus: dict[int, float],    # paper's tau -- used by Mode 2 (assistant-cap)
+    ff_axes: dict[int, torch.Tensor],    # per-layer FF axis vectors (second detect signal)
     compliance_taus: dict[int, float],   # per-layer thresholds for the compliance axis
-    cross_detect_taus: dict[int, float], # data-driven tau -- used by Mode 3 detect gate
+    cross_detect_taus: dict[int, float], # data-driven tau for assistant-axis detect gate
+    ff_detect_taus: dict[int, float],    # data-driven tau for FF-axis detect gate
     max_new_tokens: int,                 # max tokens to generate per prompt
-    cross_only: bool = False,            # if True, skip assistant-axis capping
 ) -> pd.DataFrame:
-    """Run baseline + assistant-cap + cross-cap for each prompt.
+    """Run baseline + cross-cap + ff-cross-cap for each prompt.
 
     Returns a DataFrame with one row per prompt containing the generated
     text from each mode, plus which layers fired and whether capping was applied.
@@ -477,26 +532,7 @@ def run_experiment(
             logger.exception("  FAILED baseline for prompt %d", prompt["idx"])
             continue                                          # skip this prompt entirely if baseline fails
 
-        # --- Mode 2: Assistant-axis capping (single axis, the existing method) ---
-        # Skip this mode if cross_only=True (e.g. for the mean-diff variant)
-        cap_ids = None
-        n_cap = 0
-        cap_active = []
-        cap_text = "NA"
-        if not cross_only:
-            try:
-                cap_ids, n_cap, cap_active = generate_capped(
-                    exp, input_ids, cap_layers, assistant_axes, assistant_taus,
-                    max_new_tokens,
-                )
-                cap_text = exp.tokenizer.decode(
-                    cap_ids[0, prompt_len:], skip_special_tokens=True
-                )
-            except Exception:
-                logger.exception("  FAILED assistant-cap for prompt %d", prompt["idx"])
-
-        # --- Mode 3: Cross-axis capping (two axes, the new method) ---
-        # Detect on the assistant axis, correct on the compliance axis
+        # --- Mode 2: Cross-axis capping (assistant-axis detect + compliance-axis correct) ---
         cross_ids = None
         try:
             cross_ids, n_triggered, n_corrected, cross_active, per_layer_events = generate_cross_capped(
@@ -518,34 +554,75 @@ def run_experiment(
             cross_text = "NA"
             per_layer_events = {}
 
+        # --- Mode 3: FF-cross-axis capping (OR-gated detection: assistant OR FF) ---
+        ff_cross_ids = None
+        try:
+            (
+                ff_cross_ids, ff_n_assist, ff_n_ff, ff_n_both,
+                ff_n_corrected, ff_cross_active, ff_per_layer_events, ff_gate_attr,
+            ) = generate_ff_cross_capped(
+                exp, input_ids, cap_layers,
+                per_layer_detect_axes=assistant_axes,  # gate 1: assistant axis
+                correct_axes=compliance_axes,          # correction: compliance axis
+                ff_axes=ff_axes,                       # gate 2: fictional-framing axis
+                detect_thresholds=cross_detect_taus,
+                correct_thresholds=compliance_taus,
+                ff_thresholds=ff_detect_taus,
+                max_new_tokens=max_new_tokens,
+            )
+            ff_cross_text = exp.tokenizer.decode(
+                ff_cross_ids[0, prompt_len:], skip_special_tokens=True
+            )
+        except Exception:
+            logger.exception("  FAILED ff-cross-cap for prompt %d", prompt["idx"])
+            ff_n_assist = 0
+            ff_n_ff = 0
+            ff_n_both = 0
+            ff_n_corrected = 0
+            ff_cross_active = []
+            ff_cross_text = "NA"
+            ff_per_layer_events = {}
+            ff_gate_attr = {}
+
         # --- Collect results for this prompt into one row ---
         rows.append({
             "prompt_idx": prompt["idx"],
             "prompt_type": prompt["type"],                     # "jailbreak" or "benign"
             "prompt_text": prompt_text,
             "baseline_text": bl_text,                          # uncapped output
-            "assistant_cap_applied": "Yes" if n_cap > 0 else "No",
-            "assistant_cap_layers": ",".join(f"L{li}" for li in cap_active) if cap_active else "",
-            "assistant_cap_text": cap_text if n_cap > 0 else "NA",
+
+            # Mode 2: cross-cap (unchanged)
             "cross_cap_applied": "Yes" if n_corrected > 0 else "No",
             "cross_cap_layers": ",".join(f"L{li}" for li in cross_active) if cross_active else "",
             "cross_cap_text": cross_text if n_corrected > 0 else "NA",
-            # Per-layer firing count: "L46=3;L47=1". Quick filter/sort column
-            # without having to parse the full trace.
             "cross_cap_fires_per_layer": ";".join(
                 f"L{li}={len(events)}" for li, events in per_layer_events.items()
             ),
-            # Full per-firing trace as JSON: {"L46": [[step, token, mag], ...]}.
-            # step=0 means prefill (the last prompt token's activation produced
-            # the correction, influencing the 1st generated token). step=k>=1
-            # means the forward pass processing the k-th-position token.
             "cross_cap_push_trace": _format_push_trace(
                 per_layer_events, cross_ids, prompt_len, exp.tokenizer
             ) if cross_ids is not None else "",
+
+            # Mode 3: ff-cross-cap (new)
+            "ff_cross_cap_applied": "Yes" if ff_n_corrected > 0 else "No",
+            "ff_cross_cap_layers": ",".join(f"L{li}" for li in ff_cross_active) if ff_cross_active else "",
+            "ff_cross_cap_text": ff_cross_text if ff_n_corrected > 0 else "NA",
+            "ff_cross_cap_fires_per_layer": ";".join(
+                f"L{li}={len(events)}" for li, events in ff_per_layer_events.items()
+            ),
+            "ff_cross_cap_push_trace": _format_push_trace(
+                ff_per_layer_events, ff_cross_ids, prompt_len, exp.tokenizer
+            ) if ff_cross_ids is not None else "",
+            # Per-layer gate attribution: "L46=A3,F2,B1;L47=A1,F0,B0".
+            # A = assistant gate fired, F = FF gate fired, B = both fired.
+            # In OR mode, F-only fires (A - B vs F - B) are the new signal
+            # the FF axis contributes beyond what cross-cap already caught.
+            "ff_cross_cap_gate_attribution": ";".join(
+                f"L{li}=A{a},F{f},B{b}" for li, (a, f, b) in ff_gate_attr.items()
+            ),
         })
 
         # Free GPU memory between prompts to avoid OOM on long runs
-        del bl_ids, cap_ids, cross_ids
+        del bl_ids, cross_ids, ff_cross_ids
         torch.cuda.empty_cache()
 
     return pd.DataFrame(rows)
@@ -621,18 +698,17 @@ def build_prompts(cfg):
     return prompts
 
 
-def save_results(df, output_dir, args, cos_val, cfg, elapsed, cap_layers, cross_only=False):
+def save_results(df, output_dir, args, cos_val, cfg, elapsed, cap_layers,
+                 cos_ff_assistant=None, cos_ff_compliance=None, ff_stats=None):
     """Split the combined results DataFrame into 4 separate CSVs
     (one per capping method x prompt type) and write a metadata.json
     with the experiment configuration.
 
     The 4 CSVs are:
-      assistant_cap_jailbreak.csv   -- assistant-axis capped, jailbreak prompts
-      assistant_cap_benign.csv      -- assistant-axis capped, benign prompts
       cross_cap_jailbreak.csv       -- cross-axis capped, jailbreak prompts
       cross_cap_benign.csv          -- cross-axis capped, benign prompts
-
-    (If cross_only=True, the assistant_cap files are skipped.)
+      ff_cross_cap_jailbreak.csv    -- FF-cross-axis capped, jailbreak prompts
+      ff_cross_cap_benign.csv       -- FF-cross-axis capped, benign prompts
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -641,20 +717,24 @@ def save_results(df, output_dir, args, cos_val, cfg, elapsed, cap_layers, cross_
     bn = df[df["prompt_type"] == "benign"]
 
     def save_cap_csv(subset, method, path):
-        """Extract the columns belonging to one capping method and save."""
+        """Extract the columns belonging to one capping method and save.
+
+        method is either "cross" or "ff_cross" -- the column prefix in df.
+        """
         out = subset[["prompt_idx", "prompt_text", "baseline_text"]].copy()
         out["correction_applied"] = subset[f"{method}_cap_applied"]   # Yes/No
         out["layers"] = subset[f"{method}_cap_layers"]                 # e.g. "L46,L47,L48"
         out["capped_text"] = subset[f"{method}_cap_text"]              # the actual output text
-        # Cross-cap tracks per-layer push magnitudes; assistant-cap doesn't.
-        if method == "cross":
-            out["fires_per_layer"] = subset["cross_cap_fires_per_layer"]
-            out["push_trace"]      = subset["cross_cap_push_trace"]
+        out["fires_per_layer"] = subset[f"{method}_cap_fires_per_layer"]
+        out["push_trace"]      = subset[f"{method}_cap_push_trace"]
+        # ff-cross-cap additionally records which gate (assistant / FF / both) fired
+        if method == "ff_cross":
+            out["gate_attribution"] = subset["ff_cross_cap_gate_attribution"]
         out.to_csv(path, index=False)
         return out
 
     # Build a (method, subset_label, subset_df) grid and save one CSV per cell.
-    methods = ["cross"] if cross_only else ["assistant", "cross"]
+    methods = ["cross", "ff_cross"]
     subsets = [("jailbreak", jb), ("benign", bn)]
     saved: dict[tuple[str, str], pd.DataFrame] = {}
     for method in methods:
@@ -671,14 +751,19 @@ def save_results(df, output_dir, args, cos_val, cfg, elapsed, cap_layers, cross_
         "n_benign": len(bn),
         "max_new_tokens": cfg["MAX_NEW_TOKENS"],
         "timestamp": datetime.now().isoformat(),
-        "cos_similarity": cos_val,                             # how similar the two axes are
-        "assistant_threshold_method": "paper (load_original_capping) -- used by Mode 2",
+        "cos_assistant_compliance": cos_val,                   # cos(v_assist, v_compliance) at last cap layer
+        "cos_ff_assistant": cos_ff_assistant,                  # cos(v_ff, v_assist) at last cap layer
+        "cos_ff_compliance": cos_ff_compliance,                # cos(v_ff, v_compliance) at last cap layer
         "compliance_threshold_method": cfg.get("COMPLIANCE_THRESHOLD", "optimal75"),
-        "cross_detect_method": cfg.get("CROSS_DETECT_METHOD", "benign-p5"),
+        "cross_detect_method": cfg.get("CROSS_DETECT_METHOD", "benign-p1"),
+        "ff_detect_method": cfg.get("FF_DETECT_METHOD", "benign-p99"),
         "n_detect_cal": cfg.get("N_DETECT_CAL"),
+        "n_ff_compliance": cfg.get("N_FF_COMPLIANCE"),
+        "n_ff_detect_cal": cfg.get("N_FF_DETECT_CAL"),
         "orthogonalize": cfg.get("ORTHOGONALIZE", False),
         "axis_method": cfg.get("AXIS_METHOD", "pca"),
-        "cross_only": cross_only,
+        "ff_axis_method": "mean_diff",
+        "ff_stats_last_layer": ff_stats.get(cap_layers[-1]) if ff_stats else None,
     }
     with open(output_dir / "metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
@@ -687,17 +772,18 @@ def save_results(df, output_dir, args, cos_val, cfg, elapsed, cap_layers, cross_
     print(f"\n{'=' * 50}")
     print(f"Results ({elapsed / 60:.1f} min)")
     print(f"{'=' * 50}")
-    def _print_per_layer(subset, label):
+
+    def _print_per_layer(subset, col_applied, col_trace):
         """Show, for each cap layer, (total firings, total push) across the
         subset. Lets you see where in the network the correction is actually
         doing work: firings cluster at some depth, push magnitude at another."""
-        fired = subset[subset["cross_cap_applied"] == "Yes"]
+        fired = subset[subset[col_applied] == "Yes"]
         if len(fired) == 0:
             print(f"    per-layer: (no firings)")
             return
         layer_fires: dict[str, int] = {}
         layer_push: dict[str, float] = {}
-        for raw in fired["cross_cap_push_trace"]:
+        for raw in fired[col_trace]:
             if not raw:
                 continue
             try:
@@ -715,21 +801,18 @@ def save_results(df, output_dir, args, cos_val, cfg, elapsed, cap_layers, cross_
                 f"push_mean={layer_push[layer] / max(layer_fires[layer], 1):.3f}"
             )
 
-    print(f"\nJailbreak prompts ({len(jb)}):")
-    if not cross_only:
-        print(f"  Assistant cap fired: {(jb['assistant_cap_applied'] == 'Yes').sum()}/{len(jb)}")
-    print(f"  Cross cap corrected: {(jb['cross_cap_applied'] == 'Yes').sum()}/{len(jb)}")
-    _print_per_layer(jb, "jailbreak")
-    print(f"\nBenign prompts ({len(bn)}):")
-    if not cross_only:
-        print(f"  Assistant cap fired: {(bn['assistant_cap_applied'] == 'Yes').sum()}/{len(bn)}")
-    print(f"  Cross cap corrected: {(bn['cross_cap_applied'] == 'Yes').sum()}/{len(bn)}")
-    _print_per_layer(bn, "benign")
+    for subset_label, subset in [("Jailbreak", jb), ("Benign", bn)]:
+        print(f"\n{subset_label} prompts ({len(subset)}):")
+        print(f"  Cross cap corrected:    {(subset['cross_cap_applied'] == 'Yes').sum()}/{len(subset)}")
+        _print_per_layer(subset, "cross_cap_applied", "cross_cap_push_trace")
+        print(f"  FF-cross cap corrected: {(subset['ff_cross_cap_applied'] == 'Yes').sum()}/{len(subset)}")
+        _print_per_layer(subset, "ff_cross_cap_applied", "ff_cross_cap_push_trace")
+
     print(f"\nSaved to {output_dir}/")
     for method in methods:
         for subset_label, _ in subsets:
             name = f"{method}_cap_{subset_label}.csv"
-            print(f"  {name:<28} ({len(saved[(method, subset_label)])} rows)")
+            print(f"  {name:<32} ({len(saved[(method, subset_label)])} rows)")
     print(f"  metadata.json")
 
 
@@ -820,8 +903,8 @@ def _compute_warmup_state(exp, cfg) -> dict:
               f"refusing={s['mean_refusing']:.1f}+/-{s['std_refusing']:.1f}  "
               f"compliant={s['mean_compliant']:.1f}+/-{s['std_compliant']:.1f}")
 
-    # Step 4: Cross-cap detection tau (assistant axis vector unchanged;
-    # paper's assistant_taus stay in use for Mode 2).
+    # Step 4: Cross-cap detection tau on the assistant axis, calibrated from
+    # your own benign prompts. The assistant axis vector itself is unchanged.
     cross_detect_method = cfg["CROSS_DETECT_METHOD"]
     benign_detect_cal = CALIBRATION_PROMPTS[:n_detect_cal]
     print(
@@ -840,15 +923,90 @@ def _compute_warmup_state(exp, cfg) -> dict:
         print(f"  L{li}: paper={assistant_taus[li]:.2f}  new={cross_detect_taus[li]:.2f}  "
               f"benign={s['mean_benign']:.2f}+/-{s['std_benign']:.2f}")
 
+    # Step 5: Build the fictional-framing (FF) axis and calibrate its
+    # detection threshold on held-out FF-benign prompts.
+    n_ff_compliance = cfg["N_FF_COMPLIANCE"]
+    n_ff_detect_cal = cfg["N_FF_DETECT_CAL"]
+    ff_detect_method = cfg["FF_DETECT_METHOD"]
+
+    print(f"\nBuilding FF axis (mean-diff) from pre-curated JSONL files...")
+    ff_jb_rows, ff_benign_rows = load_ff_datasets(REPO_ROOT)
+
+    # Data-leakage guard: FF-jb IDs must not overlap WJ-eval IDs.
+    # The WJ eval loader enumerates adversarial_harmful rows in order;
+    # FF-jb IDs (50142, 50381, ...) look like WJ-train indices, so the
+    # intersection should be empty -- assert it to catch future changes.
+    wj_eval = load_jailbreak_dataset(n_prompts=cfg["N_PROMPTS"])
+    wj_eval_ids = {b["id"] for b in wj_eval}
+    ff_jb_ids = {r["id"] for r in ff_jb_rows}
+    overlap = ff_jb_ids & wj_eval_ids
+    if overlap:
+        raise AssertionError(
+            f"FF-jb / WJ-eval ID overlap detected ({len(overlap)} rows: "
+            f"{sorted(overlap)[:5]}...). This would leak eval prompts into "
+            f"axis construction. Remove the overlapping rows before continuing."
+        )
+
+    # Slice the FF-benign set into disjoint calibration / axis-build halves.
+    # [0 : n_ff_detect_cal] = threshold calibration (held-out from axis-build)
+    # [n_ff_detect_cal : n_ff_detect_cal + n_ff_compliance] = axis-build benign side
+    if len(ff_benign_rows) < n_ff_detect_cal + n_ff_compliance:
+        raise ValueError(
+            f"FF-benign set too small: have {len(ff_benign_rows)}, "
+            f"need {n_ff_detect_cal + n_ff_compliance} "
+            f"(= N_FF_DETECT_CAL {n_ff_detect_cal} + N_FF_COMPLIANCE {n_ff_compliance})"
+        )
+    ff_benign_cal_prompts = [r["text"] for r in ff_benign_rows[:n_ff_detect_cal]]
+    ff_benign_axis_prompts = [
+        r["text"] for r in ff_benign_rows[n_ff_detect_cal:n_ff_detect_cal + n_ff_compliance]
+    ]
+    ff_jb_prompts = [r["text"] for r in ff_jb_rows]
+
+    print(f"  FF data: {len(ff_jb_prompts)} jb (all), "
+          f"{len(ff_benign_axis_prompts)} benign for axis, "
+          f"{len(ff_benign_cal_prompts)} benign for tau calibration")
+
+    ff_axes, ff_stats, _, _ = compute_mean_diff_ff_axis(
+        exp, ff_jb_prompts, ff_benign_axis_prompts, cap_layers,
+    )
+
+    # Cosine checks: if FF axis is highly correlated with assistant or
+    # compliance axis, the OR gate is redundant with cross-cap. Warn if so.
+    last_li = cap_layers[-1]
+    cos_ff_assistant = (ff_axes[last_li] @ assistant_axes[last_li]).item()
+    cos_ff_compliance = (ff_axes[last_li] @ compliance_axes[last_li]).item()
+    print(f"  cos(ff, assistant)  at L{last_li}: {cos_ff_assistant:+.4f}")
+    print(f"  cos(ff, compliance) at L{last_li}: {cos_ff_compliance:+.4f}")
+    if abs(cos_ff_assistant) > 0.85:
+        print(f"  WARNING: |cos(ff, assistant)| > 0.85 -- FF axis may be "
+              f"redundant with the assistant-axis detection signal.")
+    if abs(cos_ff_compliance) > 0.85:
+        print(f"  WARNING: |cos(ff, compliance)| > 0.85 -- FF axis overlaps "
+              f"with the correction axis; detection/correction may collapse.")
+
+    print(f"\nFF-cap detection tau calibration "
+          f"(method={ff_detect_method}, benign={len(ff_benign_cal_prompts)})")
+    ff_detect_taus, ff_detect_stats = compute_ff_detect_thresholds(
+        exp, ff_benign_cal_prompts, ff_axes, cap_layers,
+        method=ff_detect_method,
+    )
+
     return {
+        "version": "ff_v1",                          # cache format version -- chunk workers refuse older caches
         "cap_layers": cap_layers,                    # authoritative layer list for chunk/merge
         "assistant_axes": assistant_axes,
         "compliance_axes": compliance_axes,
-        "assistant_taus": assistant_taus,            # paper's, used by Mode 2
+        "assistant_taus": assistant_taus,            # paper's (unused by generation now; kept for audit)
         "compliance_taus": compliance_taus,
-        "cross_detect_taus": cross_detect_taus,      # data-driven, used by Mode 3 detect gate
+        "cross_detect_taus": cross_detect_taus,      # data-driven, assistant-axis detect gate
         "cross_detect_stats": cross_detect_stats,
-        "cos_similarity": cos_val,
+        "ff_axes": ff_axes,                          # fictional-framing axis (2nd detect signal)
+        "ff_detect_taus": ff_detect_taus,            # data-driven, FF-axis detect gate
+        "ff_detect_stats": ff_detect_stats,
+        "ff_stats": ff_stats,                        # per-layer axis-quality stats (auroc, separation)
+        "cos_similarity": cos_val,                   # cos(v_assist, v_compliance) at last cap layer
+        "cos_ff_assistant": cos_ff_assistant,
+        "cos_ff_compliance": cos_ff_compliance,
     }
 
 
@@ -907,16 +1065,17 @@ def do_chunk(args, cfg, output_dir):
 
     # Step 1: Load the axes and thresholds that warmup pre-computed
     state = torch.load(warmup_path, map_location="cpu", weights_only=False)
+    if state.get("version") != "ff_v1":
+        raise KeyError(
+            f"{warmup_path} is stale (version={state.get('version')!r}, "
+            f"expected 'ff_v1'). Re-run --warmup with this version of the code."
+        )
     assistant_axes = state["assistant_axes"]
     compliance_axes = state["compliance_axes"]
-    assistant_taus = state["assistant_taus"]              # paper's, Mode 2
     compliance_taus = state["compliance_taus"]
-    if "cross_detect_taus" not in state:
-        raise KeyError(
-            f"{warmup_path} is missing 'cross_detect_taus'. "
-            "Re-run --warmup with this version of the code."
-        )
-    cross_detect_taus = state["cross_detect_taus"]        # data-driven, Mode 3 detect gate
+    cross_detect_taus = state["cross_detect_taus"]        # assistant-axis detect gate
+    ff_axes = state["ff_axes"]
+    ff_detect_taus = state["ff_detect_taus"]              # FF-axis detect gate
     # Authoritative cap_layers come from warmup so chunk workers can't drift
     # away from the layers the axes were actually computed on.
     cap_layers = list(state.get("cap_layers", CAP_LAYERS))
@@ -935,13 +1094,11 @@ def do_chunk(args, cfg, output_dir):
     print(f"  Prompts {start}-{end-1} of {len(prompts)} ({len(chunk_prompts)} in this chunk)")
 
     # Step 4: Run the experiment on this chunk's prompts
-    cross_only = cfg.get("CROSS_ONLY", False)
     df = run_experiment(
         exp, chunk_prompts, cap_layers,
-        assistant_axes, compliance_axes,
-        assistant_taus, compliance_taus, cross_detect_taus,
+        assistant_axes, compliance_axes, ff_axes,
+        compliance_taus, cross_detect_taus, ff_detect_taus,
         cfg["MAX_NEW_TOKENS"],
-        cross_only=cross_only,
     )
 
     # Step 5: Save this chunk's results as a CSV
@@ -969,12 +1126,15 @@ def do_merge(args, cfg, output_dir):
     if not chunk_dir.exists():
         raise FileNotFoundError(f"{chunk_dir} not found. Run --chunk first.")
 
-    # We need the cosine similarity from warmup for the metadata file
+    # We need the cosine similarities and FF stats from warmup for metadata
     warmup_path = output_dir / WARMUP_FILE
     if not warmup_path.exists():
         raise FileNotFoundError(f"{warmup_path} not found. Run --warmup first.")
     state = torch.load(warmup_path, map_location="cpu", weights_only=False)
     cos_val = state["cos_similarity"]
+    cos_ff_assistant = state.get("cos_ff_assistant")
+    cos_ff_compliance = state.get("cos_ff_compliance")
+    ff_stats = state.get("ff_stats")
     cap_layers = list(state.get("cap_layers", CAP_LAYERS))
 
     # Find all chunk CSVs
@@ -993,8 +1153,12 @@ def do_merge(args, cfg, output_dir):
     print(f"  Total rows: {len(df)}")
 
     # Split into the 4 final CSVs and save metadata
-    cross_only = cfg.get("CROSS_ONLY", False)
-    save_results(df, output_dir, args, cos_val, cfg, elapsed=0, cap_layers=cap_layers, cross_only=cross_only)
+    save_results(
+        df, output_dir, args, cos_val, cfg, elapsed=0, cap_layers=cap_layers,
+        cos_ff_assistant=cos_ff_assistant,
+        cos_ff_compliance=cos_ff_compliance,
+        ff_stats=ff_stats,
+    )
 
 
 # ============================================================
@@ -1017,22 +1181,23 @@ def do_run(args, cfg, output_dir):
 
     state = _compute_warmup_state(exp, cfg)
 
-    cross_only = cfg.get("CROSS_ONLY", False)
     prompts = build_prompts(cfg)
 
     print(f"\nRunning experiment on {len(prompts)} prompts...")
     df = run_experiment(
         exp, prompts, state["cap_layers"],
-        state["assistant_axes"], state["compliance_axes"],
-        state["assistant_taus"], state["compliance_taus"], state["cross_detect_taus"],
+        state["assistant_axes"], state["compliance_axes"], state["ff_axes"],
+        state["compliance_taus"], state["cross_detect_taus"], state["ff_detect_taus"],
         cfg["MAX_NEW_TOKENS"],
-        cross_only=cross_only,
     )
 
     elapsed = time.time() - t_start
     save_results(
         df, output_dir, args, state["cos_similarity"], cfg, elapsed,
-        cap_layers=state["cap_layers"], cross_only=cross_only,
+        cap_layers=state["cap_layers"],
+        cos_ff_assistant=state["cos_ff_assistant"],
+        cos_ff_compliance=state["cos_ff_compliance"],
+        ff_stats=state["ff_stats"],
     )
 
 
@@ -1066,9 +1231,14 @@ def main():
     # Store options in cfg so do_warmup/do_run can use them
     cfg["COMPLIANCE_THRESHOLD"] = args.compliance_threshold
     cfg["CROSS_DETECT_METHOD"] = args.cross_detect_method
+    cfg["FF_DETECT_METHOD"] = args.ff_detect_method
     cfg["ORTHOGONALIZE"] = args.orthogonalize          # off by default now
     if args.n_detect_cal is not None:
         cfg["N_DETECT_CAL"] = args.n_detect_cal
+    if args.n_ff_compliance is not None:
+        cfg["N_FF_COMPLIANCE"] = args.n_ff_compliance
+    if args.n_ff_detect_cal is not None:
+        cfg["N_FF_DETECT_CAL"] = args.n_ff_detect_cal
 
     # CALIBRATION_PROMPTS is the benign source for detect-tau. Cap n_detect_cal
     # at what's actually available so we don't silently pad.
@@ -1085,6 +1255,9 @@ def main():
     print(f"Compliance threshold: {args.compliance_threshold}")
     print(f"Cross-cap detect method: {args.cross_detect_method}  "
           f"(n_detect_cal={cfg['N_DETECT_CAL']})")
+    print(f"FF-cap detect method:    {args.ff_detect_method}  "
+          f"(n_ff_compliance={cfg['N_FF_COMPLIANCE']}, "
+          f"n_ff_detect_cal={cfg['N_FF_DETECT_CAL']})")
     print(f"Orthogonalize: {cfg['ORTHOGONALIZE']}")
     print(f"Cap layers: L{CAP_LAYERS[0]}-L{CAP_LAYERS[-1]} ({len(CAP_LAYERS)} layers)")
 
@@ -1158,15 +1331,34 @@ def parse_args():
              "axis, recomputed from your benign calibration prompts. "
              "benign-p1 = 1st percentile (<=1%% benign FP; most selective; default). "
              "benign-p5 = 5th percentile (<=5%% benign FP). "
-             "benign-p10 = 10th percentile (<=10%% benign FP; most permissive). "
-             "The paper's assistant_taus are kept untouched for Mode 2 "
-             "(assistant-cap) either way.",
+             "benign-p10 = 10th percentile (<=10%% benign FP; most permissive).",
     )
     parser.add_argument(
         "--n-detect-cal", type=int, default=None,
         help="Override N_DETECT_CAL from the preset. Number of benign "
              "CALIBRATION_PROMPTS used for cross-detect-tau calibration. "
              "Clamped to len(CALIBRATION_PROMPTS).",
+    )
+    parser.add_argument(
+        "--ff-detect-method", type=str, default="benign-p99",
+        choices=["benign-p90", "benign-p95", "benign-p99"],
+        help="How to place the FF-axis DETECTION threshold, calibrated on a "
+             "held-out slice of classified_ff_benign.jsonl. Gate fires when "
+             "proj > tau (opposite sign from assistant axis). "
+             "benign-p99 = 99th percentile (<=1%% benign FP; default, most selective). "
+             "benign-p95 = 95th percentile (<=5%% FP). "
+             "benign-p90 = 90th percentile (<=10%% FP; most permissive).",
+    )
+    parser.add_argument(
+        "--n-ff-compliance", type=int, default=None,
+        help="Override N_FF_COMPLIANCE from the preset. Number of FF-benign "
+             "prompts used as the benign side of FF-axis construction (disjoint "
+             "from the N_FF_DETECT_CAL slice used for threshold calibration).",
+    )
+    parser.add_argument(
+        "--n-ff-detect-cal", type=int, default=None,
+        help="Override N_FF_DETECT_CAL from the preset. Number of held-out "
+             "FF-benign prompts used for FF-detect-tau calibration.",
     )
     return parser.parse_args()
 
